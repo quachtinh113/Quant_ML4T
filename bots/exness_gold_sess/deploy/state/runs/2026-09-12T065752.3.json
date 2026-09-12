@@ -1,0 +1,22 @@
+{
+  "armed": false,
+  "bot_id": "exness_gold_sess",
+  "finished_at_utc": "2026-09-12T06:57:52.330391+00:00",
+  "magic": 260903,
+  "not_ready": "no decision row exists at 2026-09-12 06:00 UTC. Either it is not a declared decision instant (session open + 60 minutes for london / new_york), or the decision bar is missing - which is kill criterion (e): do not place an order this session.",
+  "sleeves": {
+    "london": 0.5,
+    "ny": 0.5
+  },
+  "started_at_utc": "2026-09-12T06:57:46.880790+00:00",
+  "steps": {
+    "1_refresh_data": {
+      "d1_last": "2026-09-04",
+      "d1_rows": 7784,
+      "h1_last": "2026-09-04 20:00:00+00:00",
+      "h1_rows": 114173,
+      "refreshed": false
+    }
+  },
+  "stopped_at": "after 1_refresh_data"
+}

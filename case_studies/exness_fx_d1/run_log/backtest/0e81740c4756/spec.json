@@ -1,0 +1,121 @@
+{
+  "backtest_config": {
+    "account": {
+      "allow_leverage": false,
+      "allow_short_selling": true,
+      "fixed_margin_schedule": null,
+      "initial_margin": 0.5,
+      "long_maintenance_margin": 0.25,
+      "margin_pct_schedule": null,
+      "short_cash_policy": "credit",
+      "short_maintenance_margin": 0.3
+    },
+    "calendar": {
+      "calendar": "FX",
+      "data_frequency": "daily",
+      "enforce_sessions": false,
+      "timezone": "UTC"
+    },
+    "cash": {
+      "buffer_pct": 0.0,
+      "initial": 100000.0
+    },
+    "commission": {
+      "model": "percentage",
+      "rate": 0.00025
+    },
+    "execution": {
+      "execution_mode": "next_bar",
+      "execution_price": "open",
+      "mark_price": "price"
+    },
+    "feed": {
+      "ask_col": null,
+      "ask_size_col": null,
+      "bar_type": null,
+      "bid_col": null,
+      "bid_size_col": null,
+      "calendar": "FX",
+      "close_col": "close",
+      "data_frequency": "daily",
+      "entity_col": "symbol",
+      "high_col": "high",
+      "low_col": "low",
+      "mid_col": null,
+      "open_col": "open",
+      "price_col": "close",
+      "session_start_time": null,
+      "timestamp_col": "timestamp",
+      "timestamp_semantics": null,
+      "timezone": "UTC",
+      "volume_col": "volume"
+    },
+    "metadata": {
+      "cadence": "daily_ny_close",
+      "case_study": "fx_pairs",
+      "chapter": "ch17",
+      "fill_timing": "NEXT_BAR_OPEN",
+      "prediction_hash": "b7f5c6921093",
+      "preset_path": "/home/stefan/ml4t/code-fx_pairs/case_studies/fx_pairs/config/backtest/base.yaml",
+      "signal_direction": "long_only"
+    },
+    "orders": {
+      "buying_power_reservation": false,
+      "entry_order_priority": "submission",
+      "fill_ordering": "exit_first",
+      "immediate_fill": false,
+      "late_asset_min_bars": 1,
+      "late_asset_policy": "allow",
+      "missing_price_policy": "skip",
+      "next_bar_queue_shadow_validation": false,
+      "next_bar_simple_cash_check": false,
+      "next_bar_submission_precheck": false,
+      "partial_fills_allowed": false,
+      "rebalance_headroom_pct": 1.0,
+      "rebalance_mode": "incremental",
+      "reject_on_insufficient_cash": true,
+      "skip_cash_validation": false
+    },
+    "position_sizing": {
+      "share_type": "integer"
+    },
+    "settlement": {
+      "delay": 0,
+      "reduces_buying_power": true
+    },
+    "slippage": {
+      "model": "percentage",
+      "rate": 0.00025
+    },
+    "stops": {
+      "initial_hwm_source": "fill_price",
+      "stop_fill_mode": "stop_price",
+      "stop_level_basis": "fill_price",
+      "trail_hwm_source": "close",
+      "trail_stop_timing": "lagged"
+    }
+  },
+  "chapter": "ch18",
+  "preset_id": "fx_pairs:base",
+  "strategy": {
+    "allocation": {
+      "long_short": true,
+      "lookback": 63,
+      "method": "mvo_ledoit_wolf",
+      "top_k": 5
+    },
+    "rebalance": {
+      "cadence": "daily_ny_close",
+      "min_trade_value": 100.0,
+      "min_weight_change": 0.005,
+      "mode": "engine"
+    },
+    "signal": {
+      "long_short": true,
+      "method": "equal_weight_top_k",
+      "top_k": 5
+    }
+  },
+  "version": 2,
+  "_runtime_backtest_config": "BacktestConfig(allow_short_selling=True, allow_leverage=False, initial_margin=0.5, long_maintenance_margin=0.25, short_maintenance_margin=0.3, fixed_margin_schedule=None, margin_pct_schedule=None, short_cash_policy=<ShortCashPolicy.CREDIT: 'credit'>, execution_price=<ExecutionPrice.OPEN: 'open'>, mark_price=<ExecutionPrice.PRICE: 'price'>, execution_mode=<ExecutionMode.NEXT_BAR: 'next_bar'>, stop_fill_mode=<StopFillMode.STOP_PRICE: 'stop_price'>, stop_level_basis=<StopLevelBasis.FILL_PRICE: 'fill_price'>, trail_hwm_source=<WaterMarkSource.CLOSE: 'close'>, initial_hwm_source=<InitialHwmSource.FILL_PRICE: 'fill_price'>, trail_stop_timing=<TrailStopTiming.LAGGED: 'lagged'>, share_type=<ShareType.INTEGER: 'integer'>, commission_type=<CommissionType.PERCENTAGE: 'percentage'>, commission_rate=0.00025, commission_per_share=0.0, commission_per_trade=0.0, commission_minimum=0.0, slippage_type=<SlippageType.PERCENTAGE: 'percentage'>, slippage_rate=0.00025, slippage_fixed=0.0, slippage_spread=0.0, slippage_spread_by_asset={}, slippage_spread_convention=<SpreadConvention.FULL_SPREAD: 'full_spread'>, stop_slippage_rate=0.0, initial_cash=100000.0, cash_buffer_pct=0.0, settlement_delay=0, settlement_reduces_buying_power=True, reject_on_insufficient_cash=True, skip_cash_validation=False, partial_fills_allowed=False, fill_ordering=<FillOrdering.EXIT_FIRST: 'exit_first'>, entry_order_priority=<EntryOrderPriority.SUBMISSION: 'submission'>, next_bar_submission_precheck=False, next_bar_simple_cash_check=False, buying_power_reservation=False, next_bar_queue_shadow_validation=False, immediate_fill=False, rebalance_mode=<RebalanceMode.INCREMENTAL: 'incremental'>, rebalance_headroom_pct=1.0, missing_price_policy=<MissingPricePolicy.SKIP: 'skip'>, late_asset_policy=<LateAssetPolicy.ALLOW: 'allow'>, late_asset_min_bars=1, calendar='FX', timezone='UTC', data_frequency=<DataFrequency.DAILY: 'daily'>, enforce_sessions=False, preset_name=None)"
+}

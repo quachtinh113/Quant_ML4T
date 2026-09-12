@@ -1,0 +1,2 @@
+case_study	source_path	sha256	integrity	foreign_keys	training_runs	prediction_sets	backtest_runs
+fx_pairs	/home/stefan/ml4t/releases/case-studies/2026-07-22-v3.1-candidate/run_logs/fx_pairs	dd46f906cc32d7f346b01c810a45ce32fdd201f05830974101b55b53b7df7e12	ok	0	135	147	728

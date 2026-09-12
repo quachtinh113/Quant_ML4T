@@ -1,0 +1,61 @@
+# Engine defaults for exness_btc_8h. Route B fork of case_studies/exness_gold_sess/config/
+# backtest/base.yaml (itself the exness_fx_d1 / fx_pairs values) with four changes, each named
+# below. This file is repository-pinned: it does not enter the backtest hash, so it may only be
+# edited on an empty run_log/ (.claude/skills/ml4t/SKILL.md rule 5). It was authored on
+# 2026-09-08 with run_log/ empty and no registry.db, and no backtest has been run against it.
+account:
+  # The instrument can be sold as well as bought, and the swap is asymmetric (0.0 short against
+  # -1,638.6 points long), so a long-only engine would be pricing only the expensive side.
+  # NOTE for phase 5, declared here rather than discovered: `allow_short_selling` without
+  # `allow_leverage` maps to a CASH account in ml4t.backtest.broker, which is what
+  # exness_fx_d1 found leaves a top_k=1 long-short book one-legged on a third of its sessions
+  # (BOT.md open question 23). On ONE instrument that failure mode is different: there is no
+  # rotation between names, so a flip from long to short closes the whole position and opens the
+  # other side with the full proceeds. Whether the cash account expresses that flip is a phase-5
+  # measurement, not an assumption.
+  allow_short_selling: true
+execution:
+  # The decision instant IS the fill instant on this grid (setup.yaml::decision.
+  # execution_gap_minutes = 0): the price panel is keyed on the BAR CLOSE, so a weight written
+  # at the 16:00 decision matches the row "bar that closed at 16:00", and next_bar fills at the
+  # OPEN of the row that closes at 00:00 - which is the 16:00-00:00 bar's open, i.e. 16:00
+  # itself. Keyed on the bar open instead, this same pair would fill eight hours late and no
+  # cost number would be comparable with the other bots on this account.
+  execution_price: open
+  execution_mode: next_bar
+commission:
+  # Exness Pro account: no commission (user decision 2026-09-05). This is not a placeholder.
+  model: percentage
+  rate: 0.0
+slippage:
+  # THE IN-SAMPLE SPREAD, not today's. 0.001740 = 17.40 bps = the p90 of the per-bar `spread`
+  # field over the development window 2018-02-16 .. 2025-08-31 (setup.yaml::costs.
+  # spread_bps_in_sample, measured 2026-09-08). Today's tick measurement is 1.59 bps at the p90;
+  # charging that would price a 2018 crossing at a ninth of what it cost, because the broker's
+  # spread is a near-constant number of POINTS while the price rose fifteen-fold.
+  # This is the ENGINE-LEVEL fallback; the value actually charged comes from setup.yaml::costs
+  # through backtest_loaders::_normalize_cfd_costs, which takes the TOP of
+  # costs.spread_bps.crypto - the same 17.40. 13_backtest must assert the two agree before it
+  # runs, the guard bots/exness_fx_d1/BOT.md records.
+  model: percentage
+  rate: 0.001740
+calendar:
+  # `crypto` maps to None in utils/cv_splits.py::_CALENDAR_MAP - a market with no session
+  # calendar, which is the truth for a 24/7 instrument.
+  calendar: crypto
+  timezone: UTC
+  # THE AUTHORITY, not decoration. exness_gold_sess measured this on 2026-09-08: the engine
+  # library records data_frequency as explicitly provided when the preset's calendar block
+  # carries it (ml4t/backtest/config.py:774), refuses to overwrite it from the feed spec
+  # (:788-790) and pushes it back over the feed (:799-808). It moves the ENGINE's own
+  # annualisation of its equity curve (analytics/equity.py:106-113) - which this repository does
+  # NOT register: what the registry stores is run_backtest(...).metrics, computed on the DAILY
+  # return frame with evaluation.periods_per_year: 365 reconciled against the grid on hand
+  # (backtest_runner.py:102-152). So the engine's Sharpe and the registered Sharpe differ on one
+  # run and only the second is ours. Stated here so it is a named fact rather than a surprise
+  # when 13_backtest first runs.
+  # `8h` describes the registered price grid truthfully: the decision grid itself, three rows a
+  # day, every day of the week.
+  data_frequency: 8h
+metadata:
+  case_study: exness_btc_8h

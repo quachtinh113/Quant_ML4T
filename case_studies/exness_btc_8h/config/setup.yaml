@@ -1,0 +1,925 @@
+strategy_id: exness_btc_8h
+setup_version: v1
+
+# Route B fork of case_studies/exness_gold_sess (itself a Route B fork of exness_fx_d1, which
+# forked fx_pairs) for the bot bots/exness_btc_8h/BOT.md. Authored 2026-09-08 with run_log/
+# EMPTY and no registry.db, so every number below is authoring, not revision. Each one carries
+# the measurement or the file:line it came from; nothing here was inferred from a model, a
+# backtest or a fit, and no trial has been spent.
+#
+# NOT FORKED FROM crypto_perps_funding, although bots/README.md names it as the template. Three
+# reasons, all readable in that case study:
+#   (a) its own README (crypto_perps_funding/README.md:41-47, 63-69) says "The complete release
+#       pipeline is not yet supported" and "Notebooks 13-17 are not a current end-to-end
+#       strategy";
+#   (b) its whole signal axis is the perpetual's premium index and its funding settlements - all
+#       six families of its setup.yaml:210-270 read one or the other - so removing funding, which
+#       a CFD does not have, removes every feature it builds;
+#   (c) its timing is the perpetual's timing: `execution_mode: same_bar` fills AT the funding
+#       instant. Without funding that becomes a one-bar lookahead.
+# What IS taken from it, as reference and not as code: the slot arithmetic
+# `periods_per_year * 24 // bar_hours` = 1,095 slots a year (01_feasibility_analysis.py:535),
+# `evaluation.calendar: crypto` with `periods_per_year: 365`, and the shape of
+# `labels.rebalance_step` for an 8-hour schedule.
+#
+# What differs from exness_gold_sess, in one line each:
+#   - ONE instrument, so nothing is ranked and every statistic is a time series (features.ranked
+#     is empty, mapping.class is per_asset_signal_timing, 05_evaluation reads a pooled panel IC
+#     that on one name reduces to a Spearman correlation with a Newey-West interval);
+#   - the decision grid is the NATIVE 8-hour bar grid, not a venue session: 00:00 / 08:00 /
+#     16:00 UTC every day of the week, including weekends;
+#   - the market never closes, so there is no session calendar, no early close and no holiday;
+#   - SWAP is a first-order cost here rather than a footnote: -1,638.6 points per lot per night
+#     on the long side, charged EVERY night including weekends and TRIPLED on Friday.
+
+universe:
+  # Bare name; the Market Watch name on this Exness account is BTCUSDm (suffix "m"), applied
+  # only inside bots/_shared/mt5_loader.py::SYMBOL_MAP. Convention fixed in
+  # bots/exness_fx_d1/BOT.md so an account-type change does not re-hash every label.
+  symbols:
+    - BTCUSD
+  n_assets: 1
+  # MEASURED 2026-09-08 on ML4T_DATA_PATH/mt5/4h.parquet (18,756 H4 bars, 2018-02-09 08:00 ->
+  # 2026-09-05 12:00 UTC, downloaded 2026-09-05 by bots/_shared/mt5_loader.py::download_mt5_bars).
+  # This is the first date from which the folded 8-hour grid is COMPLETE. Before it the account's
+  # first served week is ragged: ten 8-hour slots are missing outright (2018-02-09 16:00,
+  # 02-10 00:00 / 08:00, 02-12 08:00 / 16:00, 02-13 00:00 / 08:00 / 16:00, 02-14 00:00,
+  # 02-15 00:00) and six more slots hold only ONE H4 bar instead of two (2018-02-10 16:00,
+  # 02-11 00:00 / 08:00, 02-12 00:00, 02-14 08:00, 02-15 08:00) - a half bar published under a
+  # full bar's name. From 2018-02-16 onward: 9,371 consecutive slots to 2026-09-05 16:00 with
+  # ZERO missing and ZERO half-slots, every one folded from exactly two H4 bars. The census is
+  # re-run as a test in bots/exness_btc_8h/tests/test_data_quality.py, on the development window
+  # only, so this line cannot rot.
+  history_start: '2018-02-16'
+
+decision:
+  # Parsed by case_studies/utils/backtest_loaders.py::_intraday_cadence_interval (:1369-1382):
+  # `<n>_<unit>` -> timedelta(8h), and _on_the_clock then keeps exactly the timestamps whose
+  # second-of-day is a whole multiple of 28,800 - which is 00:00, 08:00 and 16:00 UTC and
+  # nothing else. The token is checked, not assumed: 01_feasibility_analysis asserts that the
+  # interval this string resolves to equals the spacing of the grid it measures.
+  #
+  # NOT `8_hour_funding_aligned`, the crypto_perps_funding token. That name asserts an alignment
+  # to a perpetual venue's funding settlements, and a CFD has no funding: the name would be a
+  # claim this instrument cannot support. The three instants coincide with the perp venues'
+  # funding clock for the ordinary reason that both are thirds of a UTC day.
+  cadence: 8_hour
+  # SLOT-LEVEL statistics - N, N_eff, IC, the training-data floor, the warmup budget - are counted
+  # in these units: 3 decisions a day x 365 days. Kept SEPARATE from
+  # `evaluation.periods_per_year` (365), which annualises the engine's RETURN series and is a
+  # daily grid. Declaring 1,095 as the annualisation factor would inflate every Sharpe by
+  # sqrt(1095/365) = 1.732x. The split is the exness_gold_sess pattern
+  # (exness_gold_sess/config/setup.yaml, decision.slots_per_year 504 vs
+  # evaluation.periods_per_year 252).
+  slots_per_year: 1095
+  # A RULE, documentation only (grep -rn "snapshot" case_studies/utils/ utils/ = 0 hits). The
+  # decision instant is the CLOSE of an 8-hour bar; the panel is keyed on that close, so the
+  # `timestamp` column of every artifact IS the decision instant. The 8-hour bars are folded
+  # from the account's H4 bars by bots/_shared/mt5_loader.py::resample_4h_to_8h, which refuses a
+  # grid not aligned to a UTC hour divisible by four.
+  snapshot: bar_close_8h
+  # MEASURED, not chosen. The H4 bars this account serves open on 0/4/8/12/16/20 UTC, so folding
+  # on an 8-hour truncation gives bars opening 00/08/16 and closing 08/16/00. 01 asserts the set
+  # of decision hours is exactly {0, 8, 16}.
+  snapshots_utc: ["00:00", "08:00", "16:00"]
+  execution_delay: next_bar_open
+  # The market is open 24/7 (symbol_info trade hours on this account, derived from H1 bars over
+  # the last eight weeks: mon..sun 00:00-24:00, ML4T_DATA_PATH/mt5/history_depth.json), so the
+  # next bar's open is the decision instant itself: a decision taken at the close of the
+  # 16:00-00:00 bar is executed at the open of the 00:00-08:00 bar, and those are the same
+  # moment. There is no overnight gap and no weekend gap between a decision and its fill - the
+  # one structural advantage this instrument has over every other bot on this account.
+  # 01_feasibility_analysis measures the |fill - decision| distance and asserts it is zero.
+  # NOT a claim that the fill is free: it crosses the spread, and the spread is priced below.
+  execution_gap_minutes: 0
+  # NOT a calendar the code passes to TradingCalendar - the name records the rule. Precedent for
+  # a named non-exchange calendar: case_studies/xau_fx_mt5/config/setup.yaml:58 (mt5_24x5_utc),
+  # exness_gold_sess (metals_globex_utc). `evaluation.calendar` below is a different question:
+  # it is the calendar utils/cv_splits counts train and validation windows on.
+  session_calendar: crypto_24x7_utc
+  # MEASURED 2026-09-07 22:52:55 UTC, ServerClock.measure on BTCUSDm, login 206539306 @
+  # Exness-MT5Trial7 (bots/exness_btc_8h/tools/measure_btc_costs.py; record
+  # ML4T_DATA_PATH/mt5/symbol_info_btc_2026-09-08.json). Offset 0 minutes, unchanged from the
+  # 2026-09-05 reading in history_depth.json. The server does NOT follow any venue's daylight
+  # saving, so the three decision instants sit at the same UTC hour all year. BTCUSD is the
+  # symbol every other bot on this account measures the clock ON, precisely because it quotes on
+  # a weekend when the FX symbols do not.
+  server_clock:
+    utc_offset_minutes: 0
+    measured_at: "2026-09-07T22:52:55+00:00"
+    follows_dst_of: null
+  # ---------------------------------------------------------------------------------------
+  # THE 00:00 UTC COLLISION, declared rather than discovered. The server is UTC+0, so the swap
+  # is charged at 00:00 UTC - which is one of the three decision instants. Two facts settle what
+  # to do about it, and both are measurements taken before this file was written:
+  #
+  #   1. THE SPREAD DOES NOT WIDEN AT ROLLOVER on this account. measure_spreads' `rollover`
+  #      bucket (+-15 minutes of server midnight, 75,463 ticks of the 30-day window) reports
+  #      p50 1.29 / p90 1.58 bps - the same, to within 0.01 bp, as every other bucket. The
+  #      asset profile's advice to avoid the rollover window (bots/assets/BTCUSD.md section 5)
+  #      is FALSIFIED for this symbol on this account, and is recorded as falsified rather than
+  #      quietly ignored.
+  #   2. THE SWAP DOES BITE, and it bites on ONE slot of the three. A position opened at the
+  #      16:00 decision and closed at the 00:00 decision crosses exactly one server midnight and
+  #      pays a full night of swap; the 00:00 and 08:00 slots cross none. Measured through
+  #      bots/_shared/costs_mt5.py::holding_cost_points on the real symbol_info record:
+  #      Sun 16:00 -> Mon 00:00 = -1,638.6 points long, Mon 00:00 -> Mon 08:00 = 0.0.
+  #
+  # So all three snapshots are KEPT in the base spec - dropping the 16:00 slot would remove a
+  # third of the sample to avoid a cost that is knowable in advance and can be carried as a
+  # feature instead (features.families "swap and calendar state", columns pays_swap_night and
+  # pays_triple_swap). Whether the 16:00 slot survives its own cost is a phase-5/6 question, and
+  # the filters that would answer it are declared below as separate specs, each of which is one
+  # more trial in the Deflated Sharpe. NONE of them has been run.
+  no_trade_buckets: []
+  session_filter_values: [all, no_swap_night, us_hours]
+  # Which member of session_filter_values means "the whole grid, no filtering at all" -
+  # declared here rather than hard-coded in the shared engine (fleet mentor material #1,
+  # 2026-09-10: case_studies/utils/backtest_runner.py::apply_session_filter used to special-case
+  # `case_study == "exness_btc_8h" and book == "all"` directly; it now reads this key instead,
+  # so a future case study whose partition ALSO needs a whole-grid no-op value declares its own
+  # word here rather than the engine growing another `case_study ==` branch). Session resolvers
+  # that partition the WHOLE grid with no residual (every venue-timing bot like
+  # exness_gold_sess) omit this key entirely - there is no "no-op" book to declare when every
+  # book is a real subset.
+  session_filter_all_value: all
+  session_filter_definitions:
+    all: every decision instant (00:00, 08:00, 16:00 UTC, seven days a week)
+    no_swap_night: >-
+      the 00:00 and 08:00 decisions only. Excludes the 16:00 slot, whose hold is the one that
+      crosses server midnight and pays the nightly swap (tripled into a Friday).
+    us_hours: >-
+      the 16:00 decision only - the slot whose hold covers the US afternoon and close, which is
+      the window bots/assets/BTCUSD.md section 9 says BTCUSD co-moves with USTEC in. It is also
+      the swap-paying slot, so this filter is the expensive one and must clear a higher bar.
+  # bots/assets/BTCUSD.md section 5 also asks to avoid 04:00-07:00 UTC (the thinnest hours).
+  # NO DECISION INSTANT AND NO FILL FALLS IN THAT WINDOW: the instants are 00/08/16 and the fill
+  # is at the instant itself (execution_gap_minutes 0). The constraint is satisfied by the grid,
+  # not by a filter, and 01_feasibility_analysis asserts it rather than repeating the claim.
+  avoid_windows_utc:
+    thin_hours: ["04:00", "07:00"]
+    satisfied_by: the decision grid never lands inside it
+
+# Engine-level execution defaults; the single source of truth every Ch16-19 stage reads through
+# get_backtest_config(). Changing a value here invalidates every existing backtest_hash for this
+# case study, which is why they are settled now, with run_log/ empty.
+execution:
+  initial_cash: 100_000          # the retail cohort default every case study in this repo uses
+  # ---------------------------------------------------------------------------------------
+  # FRACTIONAL, and this is the single most consequential line in the file. It is NOT a style
+  # choice copied from crypto_perps_funding; it is forced by arithmetic that is unique to this
+  # instrument among the five bots on this account.
+  #
+  # The engine sizes a position as `target_notional / (price x multiplier)` and, under
+  # `share_type: integer`, rounds that to a whole unit. A "unit" is one unit of the instrument:
+  #   EURUSD  1 unit = 1 EUR   ~ 1.16 USD    -> 100,000 USD of equity is ~86,000 units
+  #   XAUUSD  1 unit = 1 ounce ~ 3,000 USD   -> ~33 units
+  #   BTCUSD  1 unit = 1 BTC   ~ 79,000 USD  -> ~1.27 units
+  # So on BTCUSD the integer grain is ~79 % of the whole book. A target weight of 1.0 is ONE
+  # unit and every target below 0.79 rounds to ZERO: the book would place no order at all while
+  # the sweep completed and wrote a full set of registry rows reporting a flat equity curve.
+  # That is a silent failure, not a loud one, which is why it is settled before the first row.
+  #
+  # Fractional is also what the broker actually allows: volume_min = volume_step = 0.01 lot and
+  # trade_contract_size = 1, so the smallest placeable order is 0.01 BTC (~790 USD at the
+  # measured mid) and orders move in 0.01 BTC steps. That grain is NOT expressed by the engine;
+  # it is checked in bots/exness_btc_8h/tests/ and priced in 16_costs, the same treatment
+  # exness_gold_sess gives silver's 50-ounce grain.
+  share_type: fractional
+  # ROWS OF THE PRICE FRAME, which is what the moment-based allocators read
+  # (backtest_runner.py::_apply_allocation(prices=...)). The price grid for this bot is the
+  # 8-hour decision grid itself (backtest.price_grid below), so 270 rows = 90 days = about three
+  # months - the same three months exness_fx_d1 expresses as 63 daily rows and exness_gold_sess
+  # as 1,512 H1 rows. This key DOES enter the backtest hash (research/strategy.py:304-306), so
+  # changing it later creates a new identity and cannot rewrite a registered one.
+  allocator_lookback: 270
+
+mapping:
+  # NOT a cross-sectional rank of any kind. ONE instrument: a percentile over one name is the
+  # constant 0.5 at every instant, which is worse than stale - it is degenerate. exness_fx_d1
+  # already STOPped its eight rank_* columns on five names for staleness
+  # (bots/exness_fx_d1/BOT.md, open question 12) and exness_gold_sess declared
+  # features.ranked empty on two. On one name the question does not arise at all.
+  class: per_asset_signal_timing
+  # backtest_loaders.py:2167-2169 splits this string into tokens and reads long_short from the
+  # presence of BOTH "long" and "short"; the wording is load-bearing, not decorative. Long-short
+  # is declared because the instrument can be sold as well as bought - and because the swap is
+  # ZERO on the short side and -1,638.6 points on the long side, so the two directions do not
+  # cost the same and a design that could only go long would be paying a carry the short side
+  # is paid nothing for.
+  position_state_space: long_short
+  entry_logic: threshold_on_predicted_return
+  sizing: fixed_fraction
+
+costs:
+  class: material
+  # No commission on this account type (Exness Pro, user decision 2026-09-05,
+  # bots/exness_btc_8h/BOT.md). What is left is the spread, crossed twice, plus the swap.
+  components: [spread, swap]
+  # ---------------------------------------------------------------------------------------
+  # TWO SPREAD MEASUREMENTS, AND THEY DISAGREE BY A FACTOR OF FIVE. Both are recorded, because
+  # they answer different questions and using either one for the other's question is a mistake
+  # this file exists to prevent (the distinction exness_gold_sess/PHASE1_SPEC_MENTOR.md records
+  # as X3: "tick = chi phi hien tai (cho live), per-bar = chi phi trong mau (cho backtest)").
+  #
+  #   * TICK, TODAY (spread_bps_by_session below). 3,710,378 COPY_TICKS_INFO ticks over
+  #     2026-08-08 22:52 -> 2026-09-07 22:52 UTC, through bots/_shared/costs_mt5.py::
+  #     measure_spreads. The quoted spread is a CONSTANT 1,000 points = 10.00 USD in every
+  #     session bucket and at every percentile: p50 1.28-1.29 bps, p90 1.57-1.59 bps of mid.
+  #     Round trip at the p90 = 3.18 bps. This is what a LIVE order pays now.
+  #   * PER BAR, IN SAMPLE (spread_bps_in_sample below). The `spread` field of each H4 bar in
+  #     ML4T_DATA_PATH/mt5/4h.parquet, which is the broker's own point-in-time record. Over the
+  #     development window 2018-02 -> 2025-08 it is p50 6.31 bps and p90 17.61 bps of the bar's
+  #     close - FIVE times the live number at the median and eleven times at the p90.
+  #
+  # The reason is arithmetic, not a data error: the spread is a near-constant number of POINTS
+  # (median 1,640 points over the whole sample) while BTC's price rose from ~6,700 to ~103,500
+  # over the same years, so the same spread is 14.6 bps in 2018 and 2.1 bps in 2025. Yearly
+  # medians, measured: 2018 14.56 / 2019 12.57 / 2020 7.45 / 2021 6.38 / 2022 5.30 / 2023 4.00 /
+  # 2024 4.41 / 2025 2.05 / 2026 1.83 bps.
+  #
+  # CONSEQUENCE, declared here and enforced in 16_costs: a backtest of 2018-2025 priced at
+  # today's 1.3 bps would understate its own cost by a factor of five, and would do it in the
+  # oldest years where the training data is. The cost stage prices the sample at the per-bar,
+  # point-in-time spread; the tick table is what the LIVE deployment loop and the breakeven gate
+  # for going live are read against. Exactly one bar of the 18,756 reports spread == 0 (against
+  # 1,081 zero-spread bars on gold), so no fill rule is needed here - but the count is asserted
+  # in bots/exness_btc_8h/tests/test_data_quality.py so a re-download cannot introduce one
+  # silently.
+  #
+  # Range convention, inherited from fx_pairs through exness_fx_d1 and exness_gold_sess:
+  # [lowest p50, highest p90] PER CROSSING, and _normalize_cfd_costs charges the top of it.
+  # `crypto` is a NEW pair class added to case_studies/utils/backtest_loaders.py::_cfd_pair_class
+  # in this task. Before it, that function returned "major_pairs" for any symbol containing
+  # "USD" - and BTCUSD contains "USD" - so this universe would have been priced at the FX
+  # majors' 0.6-1.3 bps in silence. It is the same defect the `metals` branch was added to stop
+  # (backtest_loaders.py:2382-2387, "would have priced gold at 1.3 bps in silence"), and the
+  # regression test lives in bots/exness_btc_8h/tests/test_cfd_pair_class.py because the code is
+  # shared.
+  #
+  # WHICH OF THE TWO GOES IN `spread_bps`, and this is the load-bearing choice: the IN-SAMPLE
+  # one. `costs.spread_bps` is what backtest_loaders::_normalize_cfd_costs turns into the
+  # engine's slippage leg (it charges the TOP of the declared range per crossing), so it is the
+  # number every Ch16-19 backtest of 2018-2025 pays. Declaring today's tick range there would
+  # have the engine charge 1.59 bps for a 2018 crossing that really cost 31 bps. The range below
+  # is therefore [in-sample p50, in-sample p90] from the per-bar field; the tick table lives
+  # under `spread_bps_by_session` and is what the LIVE loop and the go-live gate read.
+  spread_bps:
+    crypto: [6.32, 17.40]
+  spread_bps_by_session:
+    source: ticks                    # bots/_shared/costs_mt5.py::measure_spreads, COPY_TICKS_INFO
+    measured_on: "2026-09-08"
+    measured_on_account: demo        # login 206539306 @ Exness-MT5Trial7, trade_mode 0
+    window_days: 30
+    window_utc: ["2026-08-08T22:52", "2026-09-07T22:52"]
+    n_ticks: 3710378
+    # [p50, p90] bps of mid, per crossing. Unlike every other instrument on this account there is
+    # no cheap bucket and no expensive one: the quote is 1,000 points at all times.
+    BTCUSD:
+      all:      [1.29, 1.58]
+      rollover: [1.29, 1.58]
+      overlap:  [1.28, 1.57]
+      london:   [1.29, 1.57]
+      new_york: [1.29, 1.58]
+      asia:     [1.29, 1.57]
+      other:    [1.29, 1.59]
+    round_trip_p90_bps: {BTCUSD: 3.18}
+    # THE WEEKEND, measured separately because measure_spreads cannot answer it: every venue
+    # window in bots/_shared/sessions.py is weekday-only (WEEKDAYS = (0,1,2,3,4) in the venue's
+    # local calendar), so for a 24/7 symbol the whole weekend falls into the `other` bucket
+    # mixed with the weekday gaps between sessions. bots/exness_btc_8h/tools/
+    # measure_btc_weekend_spread.py splits the same 30-day tick window by UTC calendar day
+    # (record ML4T_DATA_PATH/mt5/spread_weekend_BTCUSD_2026-09-08.json):
+    #   weekday  2,799,189 ticks  p50 1.291  p90 1.572 bps
+    #   saturday   424,645 ticks  p50 1.291  p90 1.587
+    #   sunday     486,767 ticks  p50 1.294  p90 1.587
+    # The weekend costs 0.9 % more at the p90 and nothing at the median. bots/assets/BTCUSD.md
+    # section 5 says to avoid the weekend for "thanh khoan mong, spread CFD rong"; on THIS
+    # account, today, that is FALSIFIED for the spread. It is not falsified for liquidity or for
+    # gap risk, neither of which a spread quantile measures, so the weekend stays a declared
+    # state flag (features.families) rather than an exclusion.
+    weekend:
+      weekday:  [1.291, 1.572]
+      saturday: [1.291, 1.587]
+      sunday:   [1.294, 1.587]
+      measured_on: "2026-09-08"
+  spread_bps_in_sample:
+    # WHAT 16_costs PRICES THE BACKTEST WITH. The per-bar `spread` field of the H4 parquet, in
+    # points, converted to bps of that bar's close. Point-in-time by construction: the value the
+    # broker stamped on the bar the decision was taken on.
+    source: per_bar_spread_field
+    measured_on: "2026-09-08"
+    # ON THE DECISION GRID, not on the raw H4 tape. The 8-hour fold takes the FIRST H4 bar's
+    # spread (mt5_loader.resample_4h_to_8h, MT5's own convention for a bar's `spread`), so this is
+    # the value the broker stamped on the bar the decision is taken on - and it is that value, not
+    # an average of the two H4 bars, that a cost stage on this grid has to charge. Measured over
+    # the 8,261 development slots on 2026-09-08 and re-derived by 01_feasibility_analysis on every
+    # run, which prints both this line and its own recomputation so a drift is visible.
+    # For reference, the same census on all 18,756 raw H4 bars gives p50 6.31 / p90 17.61 - within
+    # 0.2 bp, which is what says the fold is not selecting a cheap half of each slot.
+    grid: 8h_decision_bar
+    development_window: ['2018-02-16', '2025-08-31']
+    n_slots: 8261
+    p50_bps: 6.32
+    p90_bps: 17.40
+    round_trip_p90_bps: 34.8
+    # ZERO on the decision grid (and exactly 1 of the 18,756 raw H4 bars), against 1,081 on gold
+    # and 1,074 on silver, where the zero-spread prefix forced a fill rule. No fill rule is needed
+    # here; the count is asserted in bots/exness_btc_8h/tests/test_data_quality.py so a
+    # re-download cannot introduce one silently.
+    zero_spread_slots: 0
+    by_year_p50_bps: {2018: 14.57, 2019: 12.55, 2020: 7.48, 2021: 6.36, 2022: 5.27,
+                      2023: 4.03, 2024: 4.41, 2025: 2.79}
+    by_decision_slot_p50_bps: {0: 6.27, 8: 6.49, 16: 6.23}
+    # The weekend is 0.6 % dearer at the median and 3.9 % at the p90 - measurable, and far smaller
+    # than the "spread CFD rong" of bots/assets/BTCUSD.md section 5.
+    weekend_p50_bps: 6.35            # against 6.31 on weekdays; p90 17.65 against 16.98
+  commission_per_lot: 0   # Exness Pro account, user decision 2026-09-05
+  # ---------------------------------------------------------------------------------------
+  # SWAP. On every other bot on this account the swap is a footnote reading 0.0 on the demo. On
+  # this one it is the largest cost in the book, it is asymmetric, and it falls on one of the
+  # three decision slots.
+  swap:
+    source: symbol_info
+    mode: points                      # swap_mode 1 = points per lot per night
+    rollover_utc: "00:00"             # server midnight; the server is UTC+0
+    # symbol_info.swap_rollover3days == 5 = FRIDAY on this symbol. NOT Wednesday: FX and metals
+    # on this account report 3 (Wednesday). Reading the FX convention onto crypto would put the
+    # triple charge on the wrong night. bots/_shared/costs_mt5.py::rollover_nights takes the
+    # value from symbol_info rather than from a constant, and the crypto rule is already
+    # implemented there (costs_mt5.py:46-48, 342, 380).
+    rollover3days: friday
+    # THE CRYPTO RULE: a charge on EVERY server-day boundary, weekends included, because the
+    # market never closes. bots/_shared/costs_mt5.py::read_swaps derives this from the Market
+    # Watch path, "Standard\Crypto\BTCUSDm" -> charges_weekends = True. FX, metals and indices
+    # skip Saturday and Sunday nights; this instrument does not.
+    charges_weekends: true
+    measured_on: "2026-09-08"
+    measured_on_account: demo
+    points_per_lot_per_night:
+      BTCUSD: {long: -1638.6, short: 0.0}
+    # DERIVED from the line above, not typed: points x point (0.01) x contract_size (1) = USD per
+    # BTC per night, and at the measured mid of 78,942.03 that is a share of notional.
+    #   long  -1,638.6 pts = -16.386 USD per BTC per night = -2.08 bps of notional per night
+    #   short  0.0
+    # A week is 7 nights plus 2 extra for the Friday triple = 9 charges; a year is
+    # 365 + 104 = 469 charges = -7,685 USD per BTC, which at 78,942 is -9.7 % a year and at
+    # 100,000 would be -7.7 %. Against a round trip of 3.18 bps at today's spread, a long
+    # position pays its whole entry-and-exit cost again every 1.5 nights it is held.
+    derived_bps_per_night: {long: -2.08, short: 0.0}
+    derived_pct_per_year_at_measured_mid: {long: -9.74, short: 0.0}
+    measured_mid: 78942.03
+    # MEASURED through bots/_shared/costs_mt5.py::holding_cost_points on the real record, over
+    # the four windows this bot actually holds for (2026-09-07 is a Monday):
+    holding_cost_points_long:
+      one_8h_bar_no_midnight: 0.0          # Mon 00:00 -> 08:00, and 08:00 -> 16:00
+      one_8h_bar_over_midnight: -1638.6    # Sun 16:00 -> Mon 00:00: THE 16:00 SLOT
+      one_day: -1638.6
+      one_week: -14747.4                   # 7 nights + the Friday triple
+    # SWAP IS NOT IN ANY LABEL, and that is a decision rather than an omission. It is a holding
+    # cost per night, not a per-crossing cost the percentage engine can express
+    # (backtest_loaders.py:2283-2285); folding it in would make every label digest depend on the
+    # account type, and would make the label of a Friday 16:00 decision a different quantity
+    # from the label of a Tuesday 16:00 decision under the same name. It is carried instead as
+    # two knowable-in-advance STATE FLAGS in the feature register (pays_swap_night,
+    # pays_triple_swap), charged in 16_costs, and it sets the breakeven gate below.
+    in_label: false
+  # symbol_info, re-read 2026-09-08 (ML4T_DATA_PATH/mt5/symbol_info_btc_2026-09-08.json).
+  contract:
+    market_watch: BTCUSDm
+    path: 'Standard\Crypto\BTCUSDm'
+    contract_size: 1
+    volume_min: 0.01
+    volume_step: 0.01
+    volume_max: 200.0
+    digits: 2
+    point: 0.01
+    currency_base: BTC
+    currency_profit: USD
+    currency_margin: BTC
+    # units = lots x contract_size; the smallest placeable order in engine units
+    min_units: 0.01
+    trade_mode: 4          # full access
+    trade_calc_mode: 5
+
+backtest:
+  # The price grid a Ch16-19 run marks and fills on. Declared now, registered in
+  # case_studies/utils/backtest_loaders.py::_PRICE_CONFIG in PHASE 5 - which is out of scope for
+  # the phase 0-3 task this file was authored in, and is listed as an open question in
+  # bots/exness_btc_8h/BOT.md rather than half-done here.
+  price_grid: 8h_decision_grid
+  # For the PRIMARY label this is trivially true and is asserted rather than assumed: the entry
+  # and the exit of a fwd_ret_8h trade are two CONSECUTIVE rows of this grid, and the fill
+  # instant equals the decision instant (decision.execution_gap_minutes 0). For fwd_ret_24h the
+  # hold spans three grid rows, which is coarse for a Ch19 stop or trailing rule; if that
+  # granularity turns out to matter, the H4 bars are available and registering them is a new
+  # identity, declared in advance. Open question in BOT.md.
+  price_grid_expresses_primary_label: true
+  rebalance:
+    default:
+      min_weight_change: 0.005
+      min_trade_value: 100.0
+    benchmark:
+      min_weight_change: 0.0
+      min_trade_value: 0.0
+  sweep:
+    # NOTHING IN THIS BLOCK HAS BEEN RUN. It is declared before any prediction exists so that the
+    # trial count K is knowable in advance, which is the only condition under which a Deflated
+    # Sharpe Ratio means anything. K = |session_filter_values| x sum over labels of
+    # (|prediction sets| x |signal_specs|).
+    # |prediction sets| is NOT |declared configurations|: config_names/training/*.yaml declares 28
+    # linear + 15 GBM = 43 CONFIGURATIONS a label, but every GBM preset checkpoints
+    # (checkpoint_interval 50, max_iterations 500 = 10 checkpoints, each its own prediction_hash),
+    # so |prediction sets| = 28 + 15*10 = 178 a label. K5 = 178 x 2 labels x 3 session books x 2
+    # signal specs = 2,136 - CORRECTED 2026-09-10 from a first-pass 516 that used |configurations|
+    # in place of |prediction sets|; see config/training/{fwd_ret_8h,fwd_ret_24h}.yaml for the
+    # arithmetic and bots/exness_btc_8h/BOT.md Decisions log 2026-09-10.
+    top_n_predictions:
+      signal: 0
+      allocation: 10
+      cost_sensitivity: 1
+      risk_overlay: 1
+    expensive_allocators_skip: false
+    session_books: [all, no_swap_night, us_hours]
+    signal_specs:
+      # equal_weight_top_k is meaningless on ONE instrument (top-1 = "hold it", and there is no
+      # second name), so neither variant is here. Both specs below are per-symbol time-series
+      # rules, which is what mapping.class declares.
+      - {name: fixed_threshold_0, method: fixed_threshold, threshold: 0.0}
+      # bars_per_day: signals.py:377 computes W = int(lookback_days * bars_per_day) over ROWS OF
+      # THE PREDICTION FRAME PER SYMBOL. On the unfiltered book that is 3 a day; on the
+      # `us_hours` and `no_swap_night` books the session filter runs BEFORE any weight is built
+      # (backtest_runner.py::apply_session_filter), so it is 1 and 2. A single value cannot be
+      # right on all three books - exactly the defect exness_gold_sess found on 2026-09-08 - so
+      # 13_backtest must set it per book from the measured modal rows-per-symbol-per-day and
+      # assert the measurement. Declared as `null` here so the value cannot be silently
+      # inherited from the template.
+      - {name: per_symbol_p80, method: per_symbol_rolling_percentile, long_q: 0.80,
+         lookback_days: 90, bars_per_day: null}
+    allocators:
+      # ONE instrument: every allocator that distributes weight ACROSS names is the identity
+      # here (score_weighted, inverse_vol, risk_parity, hrp and mvo all put 100 % on the only
+      # name). Running them would be five hashes and one result - five wasted trials in the DSR.
+      # The allocation dimension of Ch17 is therefore EMPTY for this bot, and 14_portfolio
+      # sweeps the only thing that is not degenerate on one name: the fraction of equity at risk.
+      # Declared, not run.
+      []
+    position_sizing:
+      method: volatility_target
+      note: >-
+        the Ch17 dimension that is not degenerate on one instrument. Not run in phases 0-3.
+      # n = 3, DECLARED 2026-09-10 (user approval of B1-B3, bots/exness_btc_8h/BOT.md Decisions log)
+      # BEFORE any fit, so the K6 trial count is knowable in advance
+      # (bots/exness_gold_sess/PHASE567_DECLARATION.md:266: risk overlays, and by the same logic
+      # any solvent position-sizing arm ranked alongside them, are trials; the cost grid below is
+      # not). `vol_lookback_slots: 63` reuses an already-declared feature window
+      # (features.windows.close_to_close_volatility, garman_klass) rather than inventing a new
+      # one. Target levels 0.20 / 0.40 / 0.60 annualised bracket the asset's own realised
+      # volatility scale without repeating any number from a price_stats call that touched the
+      # holdout window (Rule 1 boundary event, reviews.jsonl 2026-09-10T06:37:55Z - that reading
+      # is discarded and does not appear anywhere in this file). NOT RUN.
+      n_vol_target_arms: 3
+      vol_target_arms:
+        - {name: vol_target_20, target_annualized_vol: 0.20, vol_lookback_slots: 63}
+        - {name: vol_target_40, target_annualized_vol: 0.40, vol_lookback_slots: 63}
+        - {name: vol_target_60, target_annualized_vol: 0.60, vol_lookback_slots: 63}
+    cost_grid_bps: [0, 1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 75, 100]
+    # THE GATE 16_costs HAS TO CLEAR, declared before it runs. It is NOT the round trip alone,
+    # which is what every other bot on this account uses, because on this instrument the swap is
+    # larger than the spread on any hold that crosses a midnight. The reference is the round trip
+    # at the IN-SAMPLE p90 plus the nights the book actually holds through, and the margin is the
+    # fleet's 1.5x.
+    breakeven_gate:
+      reference: round_trip_p90_in_sample_plus_swap_nights
+      round_trip_p90_in_sample_bps: 34.8
+      swap_bps_per_night_long: -2.08
+      safety_margin: 1.5
+    risk_controls:
+      position:
+        - {name: stop_loss_3pct,  type: stop_loss,     threshold: 0.03}
+        - {name: stop_loss_5pct,  type: stop_loss,     threshold: 0.05}
+        - {name: stop_loss_10pct, type: stop_loss,     threshold: 0.10}
+        - {name: trailing_2pct,   type: trailing_stop, threshold: 0.02}
+        - {name: trailing_5pct,   type: trailing_stop, threshold: 0.05}
+        - {name: trailing_10pct,  type: trailing_stop, threshold: 0.10}
+        # `bars` is an 8-hour DECISION SLOT on this grid. time_exit_1 is the primary label's own
+        # hold and therefore cannot fire on a fwd_ret_8h book; it is here for the 24-hour book,
+        # where it is a genuinely shorter hold.
+        - {name: time_exit_1,     type: time_exit,     bars: 1}
+        - {name: time_exit_3,     type: time_exit,     bars: 3}
+
+# ===========================================================================================
+# THE FEATURE REGISTER, DECLARED 2026-09-08 BEFORE ANY INFORMATION COEFFICIENT WAS READ
+# (roadmap.md:118-120, Ch20; precedent bots/exness_fx_d1/BOT.md and exness_gold_sess).
+# `03_financial_features` binds every window from here and renders `families` as the register
+# table; no window is typed into a notebook.
+#
+# TWO GRIDS, and which grid a family sits on is the design.
+#   - `slot` families read the 8-HOUR DECISION BARS themselves. Their windows are counted in
+#     decision slots (3 a day).
+#   - `d1` families read D1 BARS and are joined ASOF BACKWARD on the D1 bar's CLOSE instant
+#     (00:00 UTC, because the server is UTC+0), never on its calendar date. For a decision at
+#     08:00 UTC on day D the newest usable D1 bar is day D-1's, which closed at 00:00 on day D.
+#     Joining on the date instead is the single most common lookahead in a bot that mixes grids.
+# The payoff is the warmup budget: a 252-bar chain is 252 D1 bars (84 days of decision slots
+# would be 756) so a long feature does not push universe.history_start forward.
+#
+# THE WARMUP BUDGET, measured before the windows were chosen. The oldest fold trains from
+# 2019-09-03 (evaluation below), and the panel opens 2018-02-16, so 1,685 decision slots are
+# available for warmup. The longest chain declared below on the slot grid is 315 slots
+# (slot_zscore_63: a 63-slot return standardised over 252 slots), well inside it. On the D1
+# grid the longest chain is 315 D1 bars and the D1 tape starts 2018-02-09, so every D1 column is
+# dense from 2018-12-21 - before the oldest training window opens.
+# ===========================================================================================
+features:
+  grid:
+    slot: 8h
+    long_window: 1d
+    long_window_join: asof_backward_on_bar_close
+    # D1 bars are read from the first D1 bar the account serves for each symbol, NOT from
+    # universe.history_start: that is the point of the two-grid design.
+    long_window_history_start: '2014-01-01'
+  # PRICED BUT NOT TRADED. These names are read for the cross-asset families below and never
+  # appear in universe.symbols, so no order is ever placed in them and no label is built on them.
+  # All three are in the same MT5 parquet this bot already reads.
+  reference_symbols: [XAUUSD, USTEC, EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD]
+  windows:
+    # -- the 8-hour decision grid ----------------------------------------------------------
+    # Trailing returns on the decision grid: 1 slot (8 h), 3 (1 day), 9 (3 days), 21 (1 week),
+    # 63 (3 weeks), 126 (6 weeks), 252 (12 weeks).
+    prev_slots: [1, 3, 9, 21, 63, 126, 252]
+    close_to_close_volatility: [21, 63]
+    garman_klass: [21, 63, 252]
+    zscore: 252                # trailing window the multi-horizon slot returns are standardised on
+    zscore_horizons: [3, 21, 63]
+    channel: [21, 63, 252]
+    bollinger: 21
+    rsi: [14, 42]
+    moving_average: [21, 63, 252]
+    drawdown: [63, 252]
+    range: [21, 63]
+    # -- the D1 long-window grid ------------------------------------------------------------
+    d1_momentum: [21, 63, 252]
+    d1_garman_klass: [21, 63]
+    d1_close_to_close_volatility: [21]
+    d1_moving_average: [21, 63, 252]
+    d1_rsi: [14]
+    d1_drawdown: [63]
+    d1_zscore: 252
+    d1_zscore_horizons: [21, 63]
+    # -- cross-asset, D1 grid, same asof-backward join ---------------------------------------
+    # Horizons the partner's return is measured over, and the window this instrument's rolling
+    # beta to it is estimated on.
+    gold: [21, 63]
+    gold_beta: 63
+    dollar: [21, 63]
+    dollar_beta: 63
+    usidx: [21, 63]
+    usidx_beta: 63
+  # EMPTY BY DESIGN, and on one instrument this is not a close call. A cross-sectional percentile
+  # over one name is the constant 0.5 at every decision instant: not stale, degenerate. Every
+  # cross-sectional mechanism of the crypto_perps_funding and fx_pairs templates
+  # (rank_*, premium_vs_median, xs_zscore, xs_dispersion, equal_weight_top_k, quantile books)
+  # is removed for the same reason and replaced by the per-symbol time-series framing declared
+  # in mapping.class. Precedent: exness_fx_d1 STOPped its 8 rank_* columns on FIVE names
+  # (BOT.md open question 12); exness_gold_sess declared this key empty on two.
+  ranked: []
+  # The column with the LONGEST CHAIN IN THE MATRIX, counted on whichever grid it lives on. Rows
+  # are kept from the slot this column can first hold a value; 03_financial_features asserts that
+  # cutting on it leaves no null anywhere except the columns named in `null_policy.may_be_null`.
+  #
+  # IT IS A D1 COLUMN HERE, and that is the opposite of exness_gold_sess, which chose a
+  # decision-grid column precisely because its D1 frame starts in 2014 while its panel opens in
+  # 2017. The two-grid head start still applies to the CROSS-ASSET partners of this bot (XAUUSD
+  # and the five FX majors serve D1 from 2014), but it does NOT apply to BTCUSD's own D1
+  # families: this account serves BTCUSD D1 from 2018-02-09, the same week as its H4 tape, so a
+  # 315-D1-bar chain is the longest thing in the matrix rather than the shortest.
+  #
+  # MEASURED 2026-09-08 on the real matrix, before any IC was read. First non-null slot per
+  # candidate: slot_zscore_63 2018-06-01, d1_price_to_ma_252d 2018-10-20, d1_ret_252d 2018-10-21,
+  # d1_zscore_21d 2018-11-10, d1_zscore_63d 2018-12-22. Cutting on slot_zscore_63 leaves four D1
+  # columns 5-8 % null on the development window; cutting on d1_zscore_63d leaves 8,431 slots
+  # (7,335 of them development) with NO null anywhere except the declared usidx family. The cost
+  # of the later cut is 612 development slots, all of them in 2018, and it buys a matrix whose
+  # null structure is one declared family rather than five accidental ones.
+  null_policy_carrier: d1_zscore_63d
+  null_policy:
+    carrier: d1_zscore_63d
+    # ONE FAMILY, declared with its cause. USTEC D1 starts 2019-07-16 on this account, so
+    # usidx_ret_21d is null until 2019-08-07 and usidx_ret_63d / usidx_beta_63d until 2019-09-18.
+    # MEASURED on the development window after the carrier cut: 684 / 810 / 810 rows of 7,335,
+    # i.e. 9.3 % and 11.0 %, every one of them before 2019-09-18. The oldest training window opens
+    # 2019-09-03, so about two weeks of fold 3's training rows carry the null and no later fold
+    # sees one at all. Cutting those rows instead would throw away nine more months of the
+    # instrument's own history to accommodate a partner series, which is the wrong trade.
+    may_be_null: [usidx_ret_21d, usidx_ret_63d, usidx_beta_63d]
+    max_null_share: 0.12     # per column, on the development window; 03 asserts it
+  persistence_horizon: 126   # decision slots F6 reads the feature autocorrelation out to
+  redundancy_cut: 0.7
+  families:
+    - name: slot momentum
+      pattern: slot_ret_*|slot_accel_*|slot_sharpe_*
+      role: signal
+      hypothesis: An eight-hour bar that moved is followed by bars that move the same way, and the difference between two horizons says whether that is accelerating
+      inputs: decision-grid closes
+      lookback: 252
+      lag: 0
+      frame: time series
+      representation: return over 1, 3, 9, 21, 63, 126 and 252 previous slots, differences between horizons, and each horizon's return over its own dispersion
+      failure_mode: reverses at the shortest horizons, and the shortest horizon is one bar of a market that never closes
+    - name: slot mean reversion
+      pattern: slot_zscore_*|slot_channel_pos_*|slot_bollinger_pctb_*
+      role: signal
+      hypothesis: A price stretched against its own recent range on this grid comes back within a few slots
+      inputs: decision-grid closes
+      lookback: 315
+      lag: 0
+      frame: time series
+      representation: trailing z-score of the multi-horizon slot returns, position in the trailing range, Bollinger %B
+      failure_mode: BTC trends for months; a z-score calls every month of a trend a dislocation
+    - name: slot volatility and range
+      pattern: slot_vol_gk_*|slot_vol_cc_*|slot_vol_ratio_*|slot_avg_range_*|slot_max_dd_*
+      role: state
+      hypothesis: Dispersion sets what a signal of a given size is worth, and how far below its own peak the price sits conditions whether a move continues
+      inputs: decision-grid OHLC
+      lookback: 252
+      lag: 0
+      frame: time series
+      representation: Garman-Klass and close-to-close deviation, short-over-long ratios, mean normalised bar range, share below the trailing peak
+      failure_mode: lags a shock by roughly half its window, and says nothing about direction
+    - name: slot oscillator and trend
+      pattern: slot_rsi_*|slot_price_to_ma_*
+      role: signal
+      hypothesis: Price against its own recent path separates a trend from an exhausted one
+      inputs: decision-grid closes
+      lookback: 252
+      lag: 0
+      frame: time series
+      representation: Wilder-smoothed oscillator, ratio to a moving average
+      failure_mode: saturates in a sustained trend, and BTC's sample is mostly sustained trends
+    - name: long-window state
+      pattern: d1_ret_*d|d1_vol_gk_*d|d1_vol_cc_*d|d1_max_dd_*d|d1_zscore_*d|d1_rsi_*|d1_price_to_ma_*d
+      role: state
+      hypothesis: Where the price sits in its own year conditions what an eight-hour signal is worth
+      inputs: D1 bars closed at or before the decision instant (asof backward on the bar's 00:00 UTC close)
+      lookback: 315
+      lag: 0
+      frame: time series
+      representation: trailing D1 momentum, Garman-Klass and close-to-close volatility, drawdown, z-score, oscillator, price to moving average
+      failure_mode: a D1 bar closes at 00:00 UTC, so at the 16:00 decision it is already sixteen hours old - which is why the join carries d1_close_ts and the point-in-time test reads the age off it
+    - name: gold
+      pattern: gold_ret_*d|gold_beta_*d
+      role: state
+      hypothesis: BTC and gold are both bid as a hedge against monetary debasement, so a gold move is a move in the thing they share rather than in BTC
+      inputs: XAUUSD D1 closes, same asof-backward join. Priced, not traded (features.reference_symbols); D1 depth on this account 3,892 bars from 2014-01-14, so the family is dense before the panel opens
+      lookback: 315
+      lag: 0
+      frame: cross-asset
+      representation: gold's trailing D1 return at two horizons, and this instrument's rolling beta to it
+      failure_mode: the correlation is famously unstable - positive in a debasement regime, zero or negative in a liquidity squeeze when BTC is sold as a risk asset
+    - name: dollar
+      pattern: usd_ret_*d|usd_beta_*d
+      role: state
+      hypothesis: BTCUSD is quoted in dollars, so part of every move is the numeraire moving rather than the asset
+      inputs: D1 closes of EURUSD, GBPUSD, USDJPY, AUDUSD and USDCAD - the five pairs of exness_fx_d1, all in the same parquet, priced and not traded here. A pair quoting the dollar second enters the signed average with its return negated
+      lookback: 315
+      lag: 0
+      frame: cross-asset
+      representation: a signed dollar proxy accumulated over two horizons, and this instrument's rolling beta to it
+      failure_mode: a signed average of five pairs is a proxy, not an estimated factor; and the pairs stop quoting at the weekend while BTCUSD does not, so the asof join carries a Friday close into Saturday and Sunday decisions - which is what a trader at those instants could actually see, and is therefore correct rather than stale
+    - name: US index
+      pattern: usidx_ret_*d|usidx_beta_*d
+      role: state
+      hypothesis: bots/assets/BTCUSD.md section 9 - BTCUSD co-moves with USTEC during US hours and is roughly independent outside them, so the index is a risk-appetite state variable and the 16:00 decision is the slot it should matter most in
+      inputs: USTEC D1 closes, same asof-backward join. Priced, not traded
+      lookback: 315
+      lag: 0
+      frame: cross-asset
+      representation: the index's trailing D1 return at two horizons, and this instrument's rolling beta to it
+      failure_mode: >-
+        DECLARED START-DATE HOLE, and it is declared here rather than discovered in an IC table.
+        This account serves USTEC D1 only from 2019-07-16 (2,191 bars, measured 2026-09-08 in
+        history_depth.json), so a 63-day beta is null until 2019-10-15 and a 252-day chain until
+        2020-07-01. The oldest training window opens 2019-09-03, so roughly the first six weeks
+        of fold 3's training data carry a null in this family and no other. It is kept, because
+        the relationship it tests is the one the asset profile names first, and it is handled the
+        way every null is handled here - median-imputed inside the fold pipeline for the linear
+        menu, read as a branch by LightGBM - with the share measured and printed in
+        03_financial_features rather than assumed to be small
+    - name: swap and calendar state
+      pattern: slot_of_day|dow|is_weekend|is_us_hours|pays_swap_night|pays_triple_swap
+      role: state
+      hypothesis: What a decision costs to hold, and how liquid its window is, differ by slot and by weekday; they condition a signal and are not one
+      inputs: the decision timestamp alone - no market data at all, so every value is knowable weeks in advance
+      lookback: 0
+      lag: 0
+      frame: state
+      representation: >-
+        slot_of_day (0, 8 or 16 UTC), dow, is_weekend, is_us_hours (the 16:00 slot, whose hold
+        covers the US afternoon), pays_swap_night (the hold from this decision to the next
+        crosses server midnight - true on the 16:00 slot and only there), pays_triple_swap (that
+        midnight ends a Friday, so the charge is tripled: symbol_info.swap_rollover3days == 5)
+      failure_mode: >-
+        pays_swap_night is a deterministic function of slot_of_day on this grid, so the two are
+        perfectly redundant and F5's redundancy tree will say so; both are kept because they
+        carry different meanings to a reader and the tree is what decides, not the author. Inside
+        a filtered book (session_filter_values) slot_of_day is constant and carries nothing there
+        - which is what the per-book staleness screen in 05_evaluation reports rather than
+        discovers
+    - name: on-chain and flow
+      pattern: PLANNED
+      role: signal
+      hypothesis: Exchange netflow, miner reserves and US spot-ETF creations are the flow variables bots/assets/BTCUSD.md names, and none of them is in a price series
+      inputs: PLANNED - not built (wording corrected 2026-09-11). The repo has two free, key-free sources already wired - DefiLlama/CoinGecko (data/crypto/onchain/, TVL only, CoinGecko capped at 365 days) and Binance perp funding/premium (crypto_perps_funding/funding_data.py) - but NEITHER supplies exchange netflow, miner reserves or US spot-ETF creations, the three variables this family names, and neither carries a vintage. Those three variables need an external vendor (e.g. Glassnode/CryptoQuant/Coin Metrics for netflow and miner reserves; ETF flow exists only from 2024-01-11), a new API key in .env, a 2018-2025 backfill and a vintage record. data/macro/config.yaml carries no on-chain series and every macro API key in .env has an EMPTY value (checked 2026-09-08, including FRED_API_KEY). A hand-typed table would be an unversioned source with no vintage
+      lookback: 0
+      lag: 0
+      frame: cross-asset
+      representation: PLANNED
+      failure_mode: declared PLANNED rather than silently omitted; +1 trial family when it is first tried, the way exness_fx_d1 handles carry
+
+# ===========================================================================================
+# Declared 2026-09-08 from the measured tape, BEFORE any label, feature or model exists for this
+# bot (roadmap.md:72-73). Development window 2018-02-16 -> 2025-08-31 = 8,261 decision slots
+# (measured). Four folds stepping back one year at a time from the holdout boundary:
+#   fold 0: train 2022-09-02 -> 2024-08-30, validate 2024-09-01 -> 2025-08-30
+#   fold 1: train 2021-09-02 -> 2023-08-31, validate 2023-09-02 -> 2024-08-31
+#   fold 2: train 2020-09-02 -> 2022-08-31, validate 2022-09-02 -> 2023-09-01
+#   fold 3: train 2019-09-03 -> 2021-08-31, validate 2021-09-02 -> 2022-09-01
+# 2,187 training slots and 1,092-1,095 validation slots per fold, with a purge of exactly 3
+# slots (= 24 hours = labels.buffer) at every boundary. MEASURED by running
+# utils.cv_splits.generate_cv_splits over the real grid on 2026-09-08; 01_feasibility_analysis
+# re-derives and asserts them, so the lines above are the design and not a second source.
+#
+# WHY THE SIZES ARE IN DAYS AND NOT IN YEARS, and this is a defect this bot had to find rather
+# than inherit. `evaluation.calendar: crypto` maps to None in utils/cv_splits.py::_CALENDAR_MAP
+# (:58) - correct, a 24/7 market has no session calendar - and with no calendar the library
+# reads `train_size` as a pandas offset alias. `_normalize_duration` turns "P2Y" into "2YE",
+# which is a YEAR-END offset, and the library then produces windows of about 320 days instead of
+# 365. Measured on this grid on 2026-09-08: P2Y/P1Y gives 2,046-slot training windows and
+# 951-954-slot validation windows, and walks the oldest training start back only to 2020-04-25 -
+# throwing away 1.4 years of usable history and shortening every validation year by six weeks,
+# in silence. P730D/P365D gives exactly the intended geometry. exness_fx_d1 and
+# exness_gold_sess are NOT affected: their `calendar: FX` maps to CME_FX and takes the
+# session-counting path instead. Left as a note for the maintainer, not fixed here: the
+# repository-wide fix would be for `_normalize_duration` to emit a Timedelta alias rather than a
+# YearEnd alias, and that would move fold boundaries for every case study whose calendar is None.
+evaluation:
+  n_splits: 4
+  train_size: P730D     # 2 years, as DAYS - see the note above
+  val_size: P365D       # 1 year, as DAYS
+  # The final twelve months of existing history - the fleet convention. Declared here, never
+  # moved, and scored ONCE by 17_holdout_predictions / 18_holdout_backtest. Nothing in phases
+  # 0-3 reads a row dated on or after holdout_start except the feature matrix, which is written
+  # through the holdout so the holdout stages have a feature vintage - and every figure and every
+  # statistic in 03, 04 and 05 is computed on rows strictly before it, asserted in each stage.
+  holdout_start: '2025-09-01'
+  holdout_end: '2026-08-31'
+  # CONTAMINATION FLAG. CHECKED read-only 2026-09-08 in the pristine archive
+  # D:/05_Quant/_archive/v9_continuum_original/config/symbols.py: the retired V9 Continuum bot's
+  # SYMBOLS carries BTCUSD (name BTCUSDm, category CRYPTO, symbols.py:99-100) and BTCUSD is also
+  # in SUPER_ELITE_SYMBOLS (symbols.py:109). STALE AS OF 2026-09-10, CORRECTED: this comment
+  # previously read "that bot ran on this same demo login until 2026-09-05", which BOT.md open
+  # question 1 (2026-09-08) already found wrong - it was still running, magic 202500, PID 5960.
+  # It was STOPPED 2026-09-10 (user decision, bots/exness_btc_8h/BOT.md Decisions log 2026-09-10):
+  # the scheduled tasks disabled, the process tree terminated, 0 open positions at the stop. It
+  # traded this same demo login for part of the declared holdout window before being stopped, so
+  # a human has seen its behaviour on this instrument over the holdout window before this bot's
+  # holdout is scored - the flag and its consequence below are UNCHANGED by the stop.
+  # Modelled on xau_fx_mt5/setup.yaml (v9_contaminated_window) and exness_gold_sess.
+  # CONSEQUENCE, declared now rather than argued later: the holdout may CONFIRM, it may not
+  # SELECT, and no parameter of this bot may be chosen because it resembles a V9 rule.
+  legacy_v9_symbols: [BTCUSD]
+  legacy_v9_contaminated_window: ['2025-09-01', '2026-08-31']
+  # The calendar utils/cv_splits counts train and validation windows on. `crypto` maps to None
+  # (no session calendar), which is right for a market that never closes - and is the reason
+  # train_size and val_size are written in days.
+  calendar: crypto
+  # Annualises the engine's RETURN series, which is written BY DAY
+  # (backtest_runner.py::extract_daily_returns_frame -> to_daily_pnl). 365, not 1,095: the price
+  # grid being 8-hourly does not change the grain the returns are aggregated to. The 1,095 that
+  # slot-level statistics need lives in `decision.slots_per_year` above. Declaring 1,095 here
+  # would inflate every Sharpe by sqrt(3) = 1.732x, and reconcile_periods_per_year would NOT
+  # catch it: a 24/7 daily grid observes ~365 rows a year, and 365/1095 = 0.33 < 0.5 would
+  # actually trip the reconciler - but on a shorter sample it might not, and a check that
+  # happens to fire is not a design.
+  periods_per_year: 365
+
+labels:
+  # Return from one decision instant to the next: the trade this bot is designed to place.
+  # The name is arithmetic and the horizon is declared EXPLICITLY, because a label name that
+  # does not parse falls through utils/artifact_specs.py::resolve_label_horizon (:177-191) to
+  # the BUFFER, and the buffer here is deliberately larger than the horizon. That trap is
+  # recorded in nasdaq100_microstructure/config/setup.yaml:604-607 and was hit again by
+  # exness_gold_sess.
+  primary: fwd_ret_8h
+  variants:
+    - fwd_ret_24h
+  horizons:
+    fwd_ret_8h: 8H
+    fwd_ret_24h: 24H
+  # PURGE. The repository has NO `embargo` key - grep -rn "embargo" case_studies/ utils/ returns
+  # only the library's own CombinatorialCV parameter, which no case study sets - so the ONLY
+  # lever on the gap between train_end and val_start is a buffer larger than the horizon.
+  # With `calendar: crypto` mapping to None, utils/cv_splits.py::_horizon_for_config returns the
+  # duration unchanged and the library reads it as clock time (:118-122). 24H is three times the
+  # 8-hour horizon of the primary label, which buys two extra slots of separation for free; the
+  # measured purge is 3 slots at every fold boundary.
+  buffer: 24H
+  variant_buffers:
+    fwd_ret_24h: 48H
+  # ---------------------------------------------------------------------------------------
+  # REPOSITORY-PINNED KEY. Authored here on 2026-09-08 with run_log/ EMPTY, derived from the
+  # cadence and the horizon and never inferred from data (SKILL.md rule 5,
+  # .claude/skills/ml4t/references/case-studies.md:139-151). It does not enter any hash, so
+  # editing it later would silently reuse rows built under the old rule.
+  # The schedule has 3 slots a day, so: 8h = one slot, 24h = three slots. At step 3 consecutive
+  # 24-hour trades are DISJOINT, which is the whole purpose of the key.
+  # KNOWN AND ACCEPTED: on the two FILTERED books (session_filter_values) the resolved schedule
+  # is 1 or 2 slots a day, so a step of 3 would walk three days rather than one - the
+  # nasdaq100_microstructure failure, "the values did not change; what they count did"
+  # (setup.yaml:632-641). 13_backtest must print resolve_rebalance_timestamps on the FILTERED
+  # grid before any sweep. Recorded in bots/exness_btc_8h/BOT.md as a phase-5 prerequisite.
+  rebalance_step:
+    fwd_ret_8h: 1
+    fwd_ret_24h: 3
+  # No classification label in this generation. A triple-barrier label of the exness_gold_sess
+  # shape is a candidate for a later one and would cost its own block of trials; it is not
+  # declared here so that it cannot be added without the count being noticed.
+  classification_eval_label: {}
+
+modeling:
+  linear:
+    # DECLARED before 06_linear is run (which is out of scope for phases 0-3). LightGBM reads a
+    # null as a branch; scikit-learn raises on one. case_studies/utils/linear.py:402-403 already
+    # fits SimpleImputer(strategy="median") then StandardScaler INSIDE the fold pipeline, on the
+    # TRAINING rows of the fold only, so nothing from the validation window reaches the fit. That
+    # is the policy, chosen over dropping rows because dropping would give each configuration a
+    # different sample and make the ICs incomparable. The nulls it is for are the `usidx` family's
+    # declared start-date hole (features.families), and nothing else.
+    null_policy: median_impute_in_fold_pipeline
+    null_policy_alternative_rejected: drop_rows_with_any_null
+  gbm:
+    libraries: [lightgbm]
+    preset: default
+    device: cpu
+    max_bin: 255                    # LightGBM's own CPU default
+    # NOT declared here on purpose: num_threads. It is a property of the host, it IS part of every
+    # training identity (gbm.py::resolve_gbm_execution_config, default 8), and declaring it in the
+    # repository copy would move the hash for every reader. It belongs in the EXPERIMENT's
+    # config/setup.yaml as `num_threads: 2` under WSL2. Companion environment note, which is part
+    # of no hash and so has to live somewhere: LD_LIBRARY_PATH must reach libgomp.so.1
+    # (/home/pro_trader/omp on this host) or LightGBM imports and then fails inside OpenMP at fit
+    # time. Both recorded in bots/exness_fx_d1/BOT.md, Decisions log.
+
+# ===========================================================================================
+# KILL CRITERIA, declarative half. B1/B2/B3 of the mentor draft were APPROVED VERBATIM by the
+# user 2026-09-10 (bots/exness_btc_8h/BOT.md Decisions log) into BOT.md's prose sections; this
+# block is the machine-readable form of research kill criterion R1 ONLY, so `12_model_analysis`
+# reads the rule from here rather than carrying 0.1144 / 0.05 / 1.0 as Python literals
+# (coordinator instruction, 2026-09-10: "Make the rule declarative in setup.yaml, not
+# hard-coded"). R2-R5 and the operational (a)-(h) criteria stay prose in BOT.md: they read
+# registry state (DSR, breakeven, PSR) that does not exist until phase 5-7 run, so there is
+# nothing yet to bind a key to.
+kill_criteria:
+  # R1 is an EARLY-CLOSE GATE (the draft's optional clause, ADOPTED by the user 2026-09-10): if
+  # r1_early_close is true and 0 of the phase-4 prediction sets clear (BH-adjusted HAC p <
+  # r1_fdr_alpha) - BH significance alone is the gate (gate_condition: bh_fdr_only).
+  # sign_consistency (r1_required_sign_consistency below) is reported, NOT gating (M2 resolved
+  # 2026-09-11, option B: code follows the approved B2 text) - 12_model_analysis
+  # writes the verdict to evaluation/r1_early_close_verdict.json and raises before any row
+  # reaches 13_backtest - the 516-before-correction / 2,136-after-correction phase-5 backtests
+  # are NOT run. Flipping this to false turns R1 back into a report-only line (roadmap.md:297)
+  # and is itself a decision that belongs in BOT.md's Decisions log before any fit.
+  r1_early_close: true
+  # IC* is the in-sample correlation a signal needs to clear the breakeven cost
+  # (backtest.sweep.breakeven_gate), reported twice in BOT.md open question 13: 0.0954 on the
+  # whole development window, 0.1144 on the validation slots 05_evaluation actually scored. R1
+  # compares against the VALIDATION figure, because 06/07/12 score validation predictions.
+  r1_ic_star_validation: 0.1144
+  # Benjamini-Hochberg alpha, the same value case_studies/exness_btc_8h/05_evaluation.py::
+  # FDR_ALPHA already applies to the 73 features, applied here to the phase-4 prediction sets
+  # via ml4t.diagnostic.evaluation.stats.benjamini_hochberg_fdr.
+  r1_fdr_alpha: 0.05
+  # reported, NOT gating (M2 resolved 2026-09-11, option B: code follows the approved B2 text).
+  # 4 of 4 validation folds pointing the configuration's OWN way (fold_ic_summary's
+  # sign_consistency, case_studies/exness_btc_8h/_model_reading.py). 12_model_analysis computes
+  # and prints/persists this against every prediction set for the reader, but clears_r1 is BH
+  # significance alone - this threshold does not enter the pass/fail test.
+  r1_required_sign_consistency: 1.0
+  # DERIVED, not typed, and printed by 12_model_analysis rather than asserted against a literal
+  # here: 178 prediction sets/label (28 linear + 15 GBM x 10 checkpoints) x 2 labels = 356. A
+  # first-pass draft used 43 configs/label x 2 labels = 86, which undercounted the GBM
+  # checkpoint schedule (case_studies/research/model_planning.py::checkpoint_schedule);
+  # corrected 2026-09-10 before 06/07/12/13 were forked (bots/exness_btc_8h/BOT.md Decisions
+  # log). This key is documentation, not a runtime assertion target - 12_model_analysis derives
+  # the true count from the registered catalog and RAISES if it disagrees with this number,
+  # which is the loud-failure direction.
+  r1_expected_prediction_sets: 356
+
+causal:
+  # The one slot-grid signal column whose construction window is unambiguous: a one-slot return
+  # reads exactly one previous bar, so a block permutation only has to span one slot.
+  treatment: slot_ret_1
+  treatment_window: 1
+  confounders: [slot_vol_gk_21, slot_vol_gk_63, slot_zscore_21]
+  method: walk_forward_dml

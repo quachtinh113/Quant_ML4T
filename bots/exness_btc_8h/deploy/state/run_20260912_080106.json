@@ -1,0 +1,11 @@
+{
+  "bot_id": "exness_btc_8h",
+  "timestamp": "2026-09-12T08:01:06.304961+00:00",
+  "magic": 260904,
+  "armed": false,
+  "shadow_mode": true,
+  "status": "success",
+  "action": "hold",
+  "reason": "cycle_completed_shadow",
+  "open_positions": 0
+}

@@ -1,0 +1,557 @@
+"""Triple barrier labeling implementation.
+
+Implements the generalized triple-barrier labeling method for financial machine learning.
+
+References
+----------
+.. [1] De Prado, M.L. (2018). Advances in Financial Machine Learning. Wiley.
+       Chapter 3: Labeling.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Literal
+
+import numpy as np
+import numpy.typing as npt
+import polars as pl
+
+from ml4t.engineer.core.exceptions import DataValidationError
+from ml4t.engineer.labeling.numba_ops import _apply_triple_barrier_nb
+from ml4t.engineer.labeling.uniqueness import (
+    calculate_label_uniqueness,
+    calculate_sample_weights,
+)
+
+if TYPE_CHECKING:  # pragma: no cover - imports used only by static analysis
+    from ml4t.engineer.config import DataContractConfig, LabelingConfig
+
+from ml4t.engineer.labeling.utils import (
+    is_duration_string,
+    parse_duration,
+    resolve_labeling_columns,
+    time_horizon_to_bars,
+    validate_price_no_nans,
+)
+
+
+def _finite_float_array(values: Any, name: str, *, positive: bool = False) -> np.ndarray:
+    """Convert a one-dimensional input to finite floats and validate its domain."""
+    try:
+        array = np.asarray(values, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise DataValidationError(f"{name} must contain numeric values") from exc
+    if array.ndim != 1 or not np.isfinite(array).all():
+        raise DataValidationError(f"{name} must contain finite numeric values")
+    if positive and np.any(array <= 0):
+        raise DataValidationError(f"{name} must contain positive values")
+    return array
+
+
+def _validate_ohlc_arrays(
+    data: pl.DataFrame,
+    price_col: str,
+    open_col: str | None,
+    high_col: str | None,
+    low_col: str | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Validate prices and return close, open, high, and low arrays."""
+    closes = _finite_float_array(data[price_col].to_numpy(), price_col, positive=True)
+    if high_col is not None and high_col not in data.columns:
+        raise DataValidationError(f"High column '{high_col}' not found in data")
+    if low_col is not None and low_col not in data.columns:
+        raise DataValidationError(f"Low column '{low_col}' not found in data")
+    if (high_col is None) != (low_col is None):
+        raise DataValidationError("high_col and low_col must be provided together")
+    if high_col is None or low_col is None:
+        if open_col is not None:
+            raise DataValidationError("open_col requires high_col and low_col")
+        return closes, np.full(len(closes), np.nan), closes, closes
+
+    highs = _finite_float_array(data[high_col].to_numpy(), high_col, positive=True)
+    lows = _finite_float_array(data[low_col].to_numpy(), low_col, positive=True)
+    if np.any(highs < lows):
+        raise DataValidationError("high prices must be greater than or equal to low prices")
+    if np.any((closes < lows) | (closes > highs)):
+        raise DataValidationError("close prices must lie within each bar's low-high range")
+
+    if open_col is None:
+        opens = np.full(len(closes), np.nan)
+    else:
+        if open_col not in data.columns:
+            raise DataValidationError(f"Open column '{open_col}' not found in data")
+        opens = _finite_float_array(data[open_col].to_numpy(), open_col, positive=True)
+        if np.any((opens < lows) | (opens > highs)):
+            raise DataValidationError("open prices must lie within each bar's low-high range")
+    return closes, opens, highs, lows
+
+
+def _prepare_barrier_arrays(
+    data: pl.DataFrame,
+    config: LabelingConfig,
+    event_indices: npt.NDArray[np.intp],
+    timestamp_col: str | None = None,
+) -> tuple[
+    npt.NDArray[np.float64],
+    npt.NDArray[np.float64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int32],
+    npt.NDArray[np.float64],
+]:
+    """Prepare barrier arrays from config.
+
+    Parameters
+    ----------
+    data : pl.DataFrame
+        Input data
+    config : LabelingConfig
+        Barrier configuration
+    event_indices : np.ndarray
+        Indices of events to label
+    timestamp_col : str | None
+        Timestamp column for time-based max_holding_period conversion
+    """
+    from datetime import timedelta
+
+    n_events = len(event_indices)
+
+    # Upper barriers
+    if config.upper_barrier is None:
+        upper_barriers = np.full(n_events, np.inf)
+    elif isinstance(config.upper_barrier, int | float):
+        upper_barriers = np.full(n_events, float(config.upper_barrier))
+    else:
+        if config.upper_barrier not in data.columns:
+            raise DataValidationError(f"Upper barrier column '{config.upper_barrier}' not found")
+        upper_barriers = _finite_float_array(
+            data[config.upper_barrier].to_numpy()[event_indices],
+            "upper barrier",
+            positive=True,
+        )
+
+    # Lower barriers
+    if config.lower_barrier is None:
+        lower_barriers = np.full(n_events, -np.inf)
+    elif isinstance(config.lower_barrier, int | float):
+        lower_barriers = np.full(n_events, float(config.lower_barrier))
+    else:
+        if config.lower_barrier not in data.columns:
+            raise DataValidationError(f"Lower barrier column '{config.lower_barrier}' not found")
+        lower_barriers = _finite_float_array(
+            data[config.lower_barrier].to_numpy()[event_indices],
+            "lower barrier",
+            positive=True,
+        )
+
+    # Max periods - now supports int, timedelta, duration string, or column name
+    max_hp = config.max_holding_period
+
+    if isinstance(max_hp, int):
+        # Integer: fixed bar count
+        max_periods = np.full(n_events, max_hp, dtype=np.int64)
+    elif isinstance(max_hp, timedelta):
+        # timedelta: convert to per-event bar counts
+        if timestamp_col is None:
+            raise DataValidationError(
+                "timestamp_col required for time-based max_holding_period (timedelta). "
+                "Provide timestamp_col parameter to triple_barrier_labels."
+            )
+        timestamps = data[timestamp_col].to_numpy().astype("datetime64[ns]").view("int64")
+        max_periods = time_horizon_to_bars(timestamps, max_hp, event_indices)
+    elif isinstance(max_hp, str) and is_duration_string(max_hp):
+        # Duration string (e.g., "1h", "30m"): convert to per-event bar counts
+        if timestamp_col is None:
+            raise DataValidationError(
+                f"timestamp_col required for time-based max_holding_period ('{max_hp}'). "
+                "Provide timestamp_col parameter to triple_barrier_labels."
+            )
+        td = parse_duration(max_hp)
+        timestamps = data[timestamp_col].to_numpy().astype("datetime64[ns]").view("int64")
+        max_periods = time_horizon_to_bars(timestamps, td, event_indices)
+    elif isinstance(max_hp, str):
+        # Column name
+        if max_hp not in data.columns:
+            raise DataValidationError(
+                f"Max holding period column '{max_hp}' not found. "
+                f"If you intended a duration, use format like '1h', '30m', '1d'."
+            )
+        raw_periods = _finite_float_array(
+            data[max_hp].to_numpy()[event_indices],
+            "holding period",
+            positive=True,
+        )
+        if np.any(raw_periods != np.floor(raw_periods)):
+            raise DataValidationError("holding period must contain integral bar counts")
+        max_periods = raw_periods.astype(np.int64)
+    else:
+        raise DataValidationError(
+            f"Invalid max_holding_period type: {type(max_hp)}. "
+            f"Expected int, timedelta, duration string ('1h'), or column name."
+        )
+
+    # Sides
+    if config.side is None:
+        sides = np.zeros(n_events, dtype=np.int32)
+    elif isinstance(config.side, int):
+        sides = np.full(n_events, config.side, dtype=np.int32)
+    else:
+        if config.side not in data.columns:
+            raise DataValidationError(f"Side column '{config.side}' not found")
+        raw_sides = _finite_float_array(
+            data[config.side].to_numpy()[event_indices],
+            "side",
+        )
+        if np.any(raw_sides != np.floor(raw_sides)) or not np.isin(raw_sides, [-1, 0, 1]).all():
+            raise DataValidationError("side must contain only -1, 0, or 1")
+        sides = raw_sides.astype(np.int32)
+
+    # Trailing stops
+    if config.trailing_stop is False or config.trailing_stop is None:
+        trailing_stops = np.zeros(n_events)
+    elif config.trailing_stop is True:
+        if config.lower_barrier is not None and isinstance(config.lower_barrier, int | float):
+            trailing_stops = np.full(n_events, abs(float(config.lower_barrier)))
+        elif config.lower_barrier is not None and isinstance(config.lower_barrier, str):
+            # Column-name lower barrier (e.g., ATR-based): use per-event values
+            if config.lower_barrier not in data.columns:
+                raise DataValidationError(
+                    f"Lower barrier column '{config.lower_barrier}' not found"
+                )
+            trailing_stops = _finite_float_array(
+                data[config.lower_barrier].to_numpy()[event_indices],
+                "trailing stop",
+                positive=True,
+            )
+        else:
+            raise DataValidationError(
+                "trailing_stop=True requires either a numeric lower_barrier to derive the "
+                "trail distance, or an explicit float value for trailing_stop (e.g., 0.02)."
+            )
+    elif isinstance(config.trailing_stop, int | float):
+        trailing_stops = np.full(n_events, float(config.trailing_stop))
+    else:
+        if config.trailing_stop not in data.columns:
+            raise DataValidationError(f"Trailing stop column '{config.trailing_stop}' not found")
+        trailing_stops = _finite_float_array(
+            data[config.trailing_stop].to_numpy()[event_indices],
+            "trailing stop",
+            positive=True,
+        )
+
+    if not np.isfinite(trailing_stops).all() or np.any(trailing_stops < 0):
+        raise DataValidationError("trailing stop values must be finite and nonnegative")
+
+    return upper_barriers, lower_barriers, max_periods, sides, trailing_stops
+
+
+def _determine_barrier_hits(labels: npt.NDArray[np.int32]) -> npt.NDArray[np.object_]:
+    """Determine which barrier was hit for each label."""
+    n_events = len(labels)
+    barrier_hit = np.empty(n_events, dtype=object)
+    for i in range(n_events):
+        if labels[i] == 1:
+            barrier_hit[i] = "upper"
+        elif labels[i] == -1:
+            barrier_hit[i] = "lower"
+        else:
+            barrier_hit[i] = "time"
+    return barrier_hit
+
+
+def _calculate_time_durations(
+    data: pl.DataFrame,
+    event_indices: npt.NDArray[np.intp],
+    label_indices: npt.NDArray[np.int64],
+    timestamp_col: str | None,
+) -> tuple[list[Any], npt.NDArray[Any]]:
+    """Calculate label times and durations."""
+    n_events = len(event_indices)
+
+    if timestamp_col is not None:
+        timestamps = data[timestamp_col].to_list()
+        label_times = [timestamps[idx] if idx < len(timestamps) else None for idx in label_indices]
+        timestamps_array = data[timestamp_col].to_numpy()
+        entry_times = timestamps_array[event_indices]
+        exit_times = timestamps_array[label_indices]
+        time_durations = exit_times - entry_times
+    else:
+        label_times = list(label_indices)
+        time_durations = np.array([None] * n_events, dtype=object)
+
+    return label_times, time_durations
+
+
+def _build_labeling_result(
+    data: pl.DataFrame,
+    event_indices: npt.NDArray[np.intp],
+    labels: npt.NDArray[np.int32],
+    label_times: list[Any],
+    label_prices: npt.NDArray[np.float64],
+    label_returns: npt.NDArray[np.float64],
+    bar_durations: npt.NDArray[np.int64],
+    time_durations: npt.NDArray[Any],
+    barrier_hit: npt.NDArray[np.object_],
+    uniqueness: npt.NDArray[np.float64] | None,
+    sample_weights: npt.NDArray[np.float64] | None,
+) -> pl.DataFrame:
+    """Build the result DataFrame from labeling outputs."""
+    calc_uniq = uniqueness is not None
+
+    if "event_time" in data.columns:
+        label_dict: dict[str, Any] = {
+            "event_index": event_indices,
+            "label": labels,
+            "label_time": label_times,
+            "label_price": label_prices,
+            "label_return": label_returns,
+            "label_bars": bar_durations,
+            "label_duration": time_durations,
+            "barrier_hit": barrier_hit,
+        }
+        if calc_uniq:
+            label_dict["label_uniqueness"] = uniqueness
+            label_dict["sample_weight"] = sample_weights
+
+        label_data = pl.DataFrame(label_dict)
+        result = (
+            data.with_row_index("event_index")
+            .join(label_data, on="event_index", how="left")
+            .drop("event_index")
+        )
+    else:
+        columns_to_add: dict[str, pl.Series] = {
+            "label": pl.Series(labels, dtype=pl.Int32),
+            "label_time": pl.Series(label_times),
+            "label_price": pl.Series(label_prices, dtype=pl.Float64),
+            "label_return": pl.Series(label_returns, dtype=pl.Float64),
+            "label_bars": pl.Series(bar_durations, dtype=pl.Int64),
+            "label_duration": pl.Series(time_durations),
+            "barrier_hit": pl.Series(barrier_hit),
+        }
+        if calc_uniq:
+            columns_to_add["label_uniqueness"] = pl.Series(uniqueness, dtype=pl.Float64)
+            columns_to_add["sample_weight"] = pl.Series(sample_weights, dtype=pl.Float64)
+
+        result = data.with_columns(**columns_to_add)
+
+    return result
+
+
+def _triple_barrier_labels_single_group(
+    data: pl.DataFrame,
+    config: LabelingConfig,
+    price_col: str,
+    open_col: str | None,
+    high_col: str | None,
+    low_col: str | None,
+    timestamp_col: str | None,
+    calculate_uniqueness: bool,
+    uniqueness_weight_scheme: Literal[
+        "returns_uniqueness", "uniqueness_only", "returns_only", "equal"
+    ],
+) -> pl.DataFrame:
+    """Apply triple barrier labeling to a single asset/group."""
+    if timestamp_col is not None:
+        data = data.sort(timestamp_col)
+
+    if "event_time" in data.columns:
+        event_mask = data["event_time"].is_not_null()
+        event_indices = np.where(event_mask.to_numpy())[0]
+        if len(event_indices) == 0:
+            return data.with_columns(
+                label=pl.lit(None, dtype=pl.Int32),
+                label_time=pl.lit(None, dtype=pl.Int64),
+                label_price=pl.lit(None, dtype=pl.Float64),
+                label_return=pl.lit(None, dtype=pl.Float64),
+                label_bars=pl.lit(None, dtype=pl.Int64),
+                label_duration=pl.lit(None, dtype=pl.Utf8),
+                barrier_hit=pl.lit(None, dtype=pl.Utf8),
+            )
+    else:
+        event_indices = np.arange(len(data))
+
+    closes, opens, highs, lows = _validate_ohlc_arrays(
+        data,
+        price_col,
+        open_col,
+        high_col,
+        low_col,
+    )
+
+    upper_barriers, lower_barriers, max_periods, sides, trailing_stops = _prepare_barrier_arrays(
+        data, config, event_indices, timestamp_col=timestamp_col
+    )
+    labels, label_indices, label_prices, label_returns, bar_durations = _apply_triple_barrier_nb(
+        closes,
+        opens,
+        highs,
+        lows,
+        event_indices,
+        upper_barriers,
+        lower_barriers,
+        max_periods,
+        sides,
+        trailing_stops,
+    )
+
+    if calculate_uniqueness:
+        uniqueness = calculate_label_uniqueness(
+            event_indices=event_indices, label_indices=label_indices, n_bars=len(closes)
+        )
+        sample_weights = calculate_sample_weights(
+            uniqueness=uniqueness, returns=label_returns, weight_scheme=uniqueness_weight_scheme
+        )
+    else:
+        uniqueness = None
+        sample_weights = None
+
+    barrier_hit = _determine_barrier_hits(labels)
+    label_times, time_durations = _calculate_time_durations(
+        data, event_indices, label_indices, timestamp_col
+    )
+
+    return _build_labeling_result(
+        data=data,
+        event_indices=event_indices,
+        labels=labels,
+        label_times=label_times,
+        label_prices=label_prices,
+        label_returns=label_returns,
+        bar_durations=bar_durations,
+        time_durations=time_durations,
+        barrier_hit=barrier_hit,
+        uniqueness=uniqueness,
+        sample_weights=sample_weights,
+    )
+
+
+def triple_barrier_labels(
+    data: pl.DataFrame,
+    config: LabelingConfig,
+    price_col: str | None = None,
+    high_col: str | None = None,
+    low_col: str | None = None,
+    timestamp_col: str | None = None,
+    group_col: str | list[str] | None = None,
+    calculate_uniqueness: bool = False,
+    uniqueness_weight_scheme: Literal[
+        "returns_uniqueness", "uniqueness_only", "returns_only", "equal"
+    ] = "returns_uniqueness",
+    contract: DataContractConfig | None = None,
+    open_col: str | None = None,
+) -> pl.DataFrame:
+    """Apply triple-barrier labeling to data.
+
+    Labels price movements based on which barrier (upper, lower, or time) is touched first.
+    Optionally calculates label uniqueness and sample weights (De Prado's AFML Chapter 4).
+
+    Parameters
+    ----------
+    data : pl.DataFrame
+        Input data with price information
+    config : LabelingConfig
+        Triple-barrier labeling configuration.
+    price_col : str | None, default None
+        Name of the price column
+    high_col : str, optional
+        Name of the high price column for OHLC barrier checking
+    low_col : str, optional
+        Name of the low price column for OHLC barrier checking
+    timestamp_col : str, optional
+        Name of the timestamp column (uses row index if None)
+    group_col : str | list[str] | None, default None
+        Grouping columns for panel labeling. If None, auto-detects common
+        asset identifier columns (e.g., symbol, product, ticker).
+    calculate_uniqueness : bool, default False
+        If True, calculates label uniqueness scores and sample weights
+    uniqueness_weight_scheme : str, default "returns_uniqueness"
+        Weighting scheme: "returns_uniqueness", "uniqueness_only", "returns_only", "equal"
+    contract : DataContractConfig | None, default None
+        Optional shared dataframe contract. Used when explicit columns/config are omitted.
+    open_col : str, optional
+        Open price used to execute gaps beyond a barrier
+
+    Returns
+    -------
+    pl.DataFrame
+        Original data with added columns: label, label_time, label_price, label_return,
+        label_bars, label_duration, barrier_hit, and optionally label_uniqueness, sample_weight
+
+    Notes
+    -----
+    With OHLC inputs, barriers execute at their configured price. If ``open_col``
+    is supplied and the bar opens beyond a barrier, execution uses the open.
+    When one OHLC bar touches both barriers, the lower or stop barrier wins because
+    the bar does not reveal the order of its extremes.
+
+    **Important**: Data is automatically sorted by [group_col, timestamp] before labeling.
+    This is required because the algorithm scans forward in row order to find
+    barrier touches. The result is returned sorted chronologically.
+
+    Examples
+    --------
+    >>> from ml4t.engineer.config import LabelingConfig
+    >>> config = LabelingConfig.triple_barrier(upper_barrier=0.02, lower_barrier=0.01)
+    >>> labeled = triple_barrier_labels(df, config)
+    """
+    from ml4t.engineer.config import LabelingConfig as _LabelingConfig
+
+    if not isinstance(config, _LabelingConfig):
+        raise TypeError(
+            "triple_barrier_labels expects LabelingConfig. "
+            "Legacy BarrierConfig inputs are no longer supported; "
+            "use LabelingConfig.triple_barrier(...)."
+        )
+
+    resolved_price_col, resolved_ts_col, group_cols = resolve_labeling_columns(
+        data=data,
+        price_col=price_col,
+        timestamp_col=timestamp_col,
+        group_col=group_col,
+        config=config,
+        contract=contract,
+    )
+    if config.method != "triple_barrier":
+        raise DataValidationError(
+            "triple_barrier_labels requires LabelingConfig.method='triple_barrier'."
+        )
+
+    validate_price_no_nans(data, resolved_price_col)
+
+    if group_cols:
+        sort_cols = group_cols + ([resolved_ts_col] if resolved_ts_col else [])
+        sorted_data = data.sort(sort_cols)
+        grouped_frames = sorted_data.partition_by(group_cols, maintain_order=True)
+
+        grouped_results = [
+            _triple_barrier_labels_single_group(
+                data=group_df,
+                config=config,
+                price_col=resolved_price_col,
+                open_col=open_col,
+                high_col=high_col,
+                low_col=low_col,
+                timestamp_col=resolved_ts_col,
+                calculate_uniqueness=calculate_uniqueness,
+                uniqueness_weight_scheme=uniqueness_weight_scheme,
+            )
+            for group_df in grouped_frames
+        ]
+        return pl.concat(grouped_results, how="vertical")
+
+    return _triple_barrier_labels_single_group(
+        data=data,
+        config=config,
+        price_col=resolved_price_col,
+        open_col=open_col,
+        high_col=high_col,
+        low_col=low_col,
+        timestamp_col=resolved_ts_col,
+        calculate_uniqueness=calculate_uniqueness,
+        uniqueness_weight_scheme=uniqueness_weight_scheme,
+    )
+
+
+__all__ = [
+    "triple_barrier_labels",
+]

@@ -1,0 +1,16 @@
+{
+  "config_name": "lasso_f0.7",
+  "family": "linear",
+  "feature_sets": [
+    "financial",
+    "model_based"
+  ],
+  "label": "fwd_ret_5d",
+  "library": "sklearn",
+  "n_folds": 8,
+  "seed": 42,
+  "params": {
+    "alpha_frac": 0.7,
+    "max_iter": 5000
+  }
+}

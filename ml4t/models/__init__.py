@@ -1,0 +1,197 @@
+"""Public package surface for ml4t-models."""
+
+from __future__ import annotations
+
+from importlib import import_module
+
+from ml4t.models._version import __version__
+from ml4t.models.api import (
+    AssetMapper,
+    AssetPredictionModel,
+    FactorForecaster,
+    LatentFactorModel,
+    PortfolioModel,
+    PortfolioPostprocessor,
+    StochasticDiscountFactorEstimator,
+)
+from ml4t.models.asset_prediction import SAEModel
+from ml4t.models.configs import (
+    AR1ForecasterConfig,
+    CAEConfig,
+    DeepPortfolioConfig,
+    EWMABaseForecasterConfig,
+    ExpandingMeanForecasterConfig,
+    IPCAConfig,
+    LinearPortfolioConfig,
+    LSTMPortfolioConfig,
+    PCAConfig,
+    RPPCAConfig,
+    SAEConfig,
+    StochasticDiscountFactorConfig,
+)
+from ml4t.models.forecasters import (
+    AR1FactorForecaster,
+    EWMABaseFactorForecaster,
+    ExpandingMeanFactorForecaster,
+)
+from ml4t.models.integration import (
+    BacktestDataFeedInputs,
+    ContextFrame,
+    PredictionsFrame,
+    ResolvedDatasetSchema,
+    ResultsFrame,
+    SignalsFrame,
+    WeightsFrame,
+    backtest_datafeed_inputs,
+    backtest_inputs_from_asset_forecast,
+    backtest_inputs_from_asset_signal,
+    backtest_inputs_from_weights,
+    context_frame_from_weights,
+    cross_section_batch_from_long_frame,
+    persistent_panel_batch_from_long_frame,
+    predictions_frame_from_asset_forecast,
+    predictions_frame_from_asset_signal,
+    resolve_dataset_schema,
+    resolve_feed_spec_mapping,
+    signals_frame_from_asset_weights,
+    signals_frame_from_portfolio_weights,
+    weights_frame_from_asset_weights,
+    weights_frame_from_portfolio_weights,
+    write_backtest_frames,
+)
+from ml4t.models.latent_factors import CAEModel, IPCAModel, PCAModel, RPPCAModel
+from ml4t.models.mappers import BetaLambdaMapper
+from ml4t.models.pipelines import (
+    LatentFactorForecastPipeline,
+    PipelineFitResult,
+    PortfolioAllocationPipeline,
+    PortfolioPipelineFitResult,
+)
+from ml4t.models.stochastic_discount_factor import (
+    LinearStochasticDiscountFactorReturnMapper,
+    StochasticDiscountFactorBetaNetworkHead,
+    StochasticDiscountFactorModel,
+)
+from ml4t.models.types import (
+    AssetForecastResult,
+    AssetSignalResult,
+    AssetWeightsResult,
+    CrossSectionBatch,
+    FactorForecastResult,
+    FitRunRecord,
+    FitSummary,
+    LatentFactorPrediction,
+    LatentFactorState,
+    PersistentPanelBatch,
+    PortfolioPrediction,
+    PortfolioSequenceBatch,
+    PortfolioWeightsResult,
+    StochasticDiscountFactorState,
+)
+
+__all__ = [
+    "AR1FactorForecaster",
+    "AR1ForecasterConfig",
+    "AssetForecastResult",
+    "AssetMapper",
+    "AssetPredictionModel",
+    "AssetSignalResult",
+    "AssetWeightsResult",
+    "BacktestDataFeedInputs",
+    "BetaLambdaMapper",
+    "CAEConfig",
+    "CAEModel",
+    "ContextFrame",
+    "CrossSectionBatch",
+    "DeepPortfolioConfig",
+    "DeepPortfolioModel",
+    "EWMABaseFactorForecaster",
+    "EWMABaseForecasterConfig",
+    "ExpandingMeanFactorForecaster",
+    "ExpandingMeanForecasterConfig",
+    "FactorForecastResult",
+    "FactorForecaster",
+    "FitRunRecord",
+    "FitSummary",
+    "IPCAConfig",
+    "IPCAModel",
+    "LSTMPortfolioConfig",
+    "LSTMPortfolioModel",
+    "LatentFactorForecastPipeline",
+    "LatentFactorModel",
+    "LatentFactorPrediction",
+    "LatentFactorState",
+    "LinearFeaturePortfolioModel",
+    "LinearPortfolioConfig",
+    "LinearStochasticDiscountFactorReturnMapper",
+    "PCAConfig",
+    "PCAModel",
+    "PersistentPanelBatch",
+    "PipelineFitResult",
+    "PortfolioAllocationPipeline",
+    "PortfolioModel",
+    "PortfolioPipelineFitResult",
+    "PortfolioPostprocessor",
+    "PortfolioPrediction",
+    "PortfolioSequenceBatch",
+    "PortfolioWeightsResult",
+    "PredictionsFrame",
+    "RPPCAConfig",
+    "RPPCAModel",
+    "ResolvedDatasetSchema",
+    "ResultsFrame",
+    "SAEConfig",
+    "SAEModel",
+    "SignalsFrame",
+    "StochasticDiscountFactorBetaNetworkHead",
+    "StochasticDiscountFactorConfig",
+    "StochasticDiscountFactorEstimator",
+    "StochasticDiscountFactorModel",
+    "StochasticDiscountFactorState",
+    "WeightConstraintPostprocessor",
+    "WeightsFrame",
+    "__version__",
+    "backtest_datafeed_inputs",
+    "backtest_inputs_from_asset_forecast",
+    "backtest_inputs_from_asset_signal",
+    "backtest_inputs_from_weights",
+    "context_frame_from_weights",
+    "cross_section_batch_from_long_frame",
+    "persistent_panel_batch_from_long_frame",
+    "predictions_frame_from_asset_forecast",
+    "predictions_frame_from_asset_signal",
+    "resolve_dataset_schema",
+    "resolve_feed_spec_mapping",
+    "signals_frame_from_asset_weights",
+    "signals_frame_from_portfolio_weights",
+    "weights_frame_from_asset_weights",
+    "weights_frame_from_portfolio_weights",
+    "write_backtest_frames",
+]
+
+
+def __getattr__(name: str):
+    module_map = {
+        "DeepPortfolioModel": ("ml4t.models.portfolio.deep_portfolio", "DeepPortfolioModel"),
+        "LinearFeaturePortfolioModel": (
+            "ml4t.models.portfolio.linear",
+            "LinearFeaturePortfolioModel",
+        ),
+        "LSTMPortfolioModel": ("ml4t.models.portfolio.lstm", "LSTMPortfolioModel"),
+        "WeightConstraintPostprocessor": (
+            "ml4t.models.portfolio.postprocessors",
+            "WeightConstraintPostprocessor",
+        ),
+    }
+    if name not in module_map:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = module_map[name]
+    try:
+        module = import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name == "torch":
+            raise ImportError(f"{name} requires PyTorch; install ml4t-models[deep]") from exc
+        raise
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value

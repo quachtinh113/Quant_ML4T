@@ -1,0 +1,91 @@
+# Engine defaults for exness_gold_sess. Copied from case_studies/exness_fx_d1/config/backtest/
+# base.yaml (itself the fx_pairs values) with three changes, each named:
+#   - data_frequency is the H1 bar grid the price loader registers (see below);
+#   - metadata.case_study is this bot;
+#   - the commission / slippage rates below are the ENGINE-LEVEL fallbacks; the values actually
+#     charged come from setup.yaml::costs through backtest_loaders::_normalize_cfd_costs
+#     (commission 0 on the Pro account, slippage = the top of costs.spread_bps.metals = 4.70 bps
+#     per crossing). 13_backtest asserts the two agree before it runs, the guard
+#     bots/exness_fx_d1/BOT.md:130 records.
+# This file is repository-pinned: it does not enter the backtest hash, so it may only be edited
+# on an empty run_log/ (.claude/skills/ml4t/SKILL.md rule 5).
+account:
+  allow_short_selling: true
+execution:
+  # UNCHANGED on purpose when data_frequency became 1h, and it is only correct because the
+  # registered grid is keyed on the BAR CLOSE (backtest_loaders::_load_via_canonical, loader
+  # "exness_gold_sess_h1"): a weight written at the 09:00 decision matches the row "bar that
+  # closed at 09:00", and next_bar fills at the OPEN of the row that closes at 10:00 - the
+  # 09:00-10:00 bar's open, which is exactly the price the session panel called the fill
+  # (_features.py:410-421) and the price decision.execution_delay: next_bar_open names.
+  # Keyed on the bar open, this same pair would fill an hour late and no cost number would be
+  # comparable with exness_fx_d1. PRICE_GRID_DECLARATION.md section 1.1.
+  execution_price: open
+  execution_mode: next_bar
+commission:
+  model: percentage
+  rate: 0.0
+slippage:
+  model: percentage
+  rate: 0.00047
+calendar:
+  calendar: FX
+  timezone: UTC
+  # 'session' -> '1h' on 2026-09-08, with run_log/ EMPTY, by
+  # bots/exness_gold_sess/PRICE_GRID_DECLARATION.md section 1.1. The registered price grid is
+  # no longer the decision panel (two rows a weekday) but the raw MT5 H1 bar grid keyed on the
+  # bar close, so the feed frequency has to say so. The HOLD is not the grid spacing: it is a
+  # broker-level TimeExit position rule declared in every 13_backtest spec, and since
+  # 2026-09-08 it is DERIVED PER BOOK - london 8 bars, ny 7 - by
+  # case_studies/exness_gold_sess/_hold.py from the rule in
+  # bots/exness_gold_sess/NY_EXIT_DECLARATION.md section 1.2.
+  #
+  # THE MEASURED TRUTH ABOUT THIS KEY, measured on 2026-09-08 because
+  # NY_EXIT_DECLARATION.md section 4.a asked for an assertion instead of a comment - and the
+  # assertion CONTRADICTED the declaration's own premise, which is why it was worth writing.
+  #
+  # The declaration said this key is decorative: "grep data_frequency finds it declared in
+  # fourteen base.yaml files and consumed by none of them", so the engine would resolve
+  # feed.data_frequency = _infer_data_frequency(cadence) = "daily" for a cadence of "session".
+  # The first half is true of THIS repository's Python. The second half is false, and the
+  # consumer is the engine library:
+  #   - backtest_presets.py:210-215 does derive feed.data_frequency = "daily" here (measured:
+  #     _infer_data_frequency("session") == "daily", and preset["feed"] is absent);
+  #   - but EngineBacktestConfig records data_frequency as EXPLICITLY PROVIDED when the preset's
+  #     calendar block carries it (ml4t/backtest/config.py:774), refuses to overwrite it from the
+  #     feed spec (:788-790) and then pushes it back over the feed in resolved_feed_spec
+  #     (:799-808, :820-822).
+  #   MEASURED on a real register=False run: spec["backtest_config"]["feed"]["data_frequency"]
+  #   resolves to **"1h"**, not "daily". So this key is the AUTHORITY, not decoration.
+  #
+  # What that authority actually moves, measured rather than feared:
+  #   (a) engine.py:181 and :320 skip bars outside sessions - but ONLY when enforce_sessions is
+  #       true, and it is FALSE here (config.py:750 default; the resolved spec shows
+  #       enforce_sessions: false and the run reports skipped_bars: 0);
+  #   (b) analytics/equity.py:106-113 annualises the ENGINE's own equity curve with
+  #       resolve_periods_per_year(feed.data_frequency, calendar) - measured 7,222.0 a year at
+  #       "1h" against 314.0 at "daily". That number reaches engine_result.metrics["sharpe"]
+  #       (-3.9995 on a Q4-2024 london probe) and NOTHING THIS REPOSITORY REGISTERS. What the
+  #       registry stores is run_backtest(...).metrics, computed here on the DAILY return frame
+  #       with evaluation.periods_per_year: 252 reconciled against the grid on hand
+  #       (backtest_runner.py:102-152): sharpe -3.2046 on the same probe.
+  #   So the two Sharpes on one run differ (-3.9995 engine, -3.2046 registered) and only the
+  #   second is ours. That gap is now a named fact rather than a surprise, and the test asserts
+  #   the split so a future change of registration path cannot silently import the first.
+  #
+  # THE VALUE IS RIGHT AND STAYS: the registered price grid IS the hourly MT5 tape, so "1h"
+  # describes the feed truthfully. What changed on 2026-09-08 is that it is no longer described
+  # as inert, and it is now checked - bots/exness_gold_sess/tests/test_backtest_grid.py asserts
+  # (a) what the engine resolves, (b) that enforce_sessions is off, and (c) that
+  # observed_periods_per_year on the daily return series of a real register=False run keeps
+  # evaluation.periods_per_year: 252 through reconcile_periods_per_year. Measured: 292.20
+  # periods a year over the full validation window and 272.93 over the Q4-2024 probe, both
+  # inside the 0.5x-2x band the reconciler keeps - which is the measurement that refutes the
+  # "an H1 grid lifts annualisation to ~6,084" premise.
+  #
+  # Cross-repository finding, unchanged and NOT this bot's to fix:
+  # nasdaq100_microstructure/config/backtest/base.yaml:22 declares 1m while its cadence infers
+  # 15m, so the same override makes ITS engine feed 1m. Reported, not touched.
+  data_frequency: 1h
+metadata:
+  case_study: exness_gold_sess

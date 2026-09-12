@@ -1,0 +1,361 @@
+# exness_fx_d1 — deployment risk configuration
+#
+# Read by bots/exness_fx_d1/deploy/deployment_loop.py and split across three layers, because
+# a limit put in the wrong layer is not enforced by the thing that is supposed to enforce it:
+#
+#   live_risk_config:  ml4t.live.LiveRiskConfig — PRE-TRADE controls SafeBroker applies to
+#                      each order before it reaches the adapter (25_live_trading/10).
+#   breakers:          the bot's own circuit breakers (26_mlops_governance/04), state machine
+#                      CLOSED/OPEN/HALF_OPEN, wired to the persistent kill switch. Drawdown,
+#                      hit rate, cost, swap and consecutive losses live HERE, not in
+#                      LiveRiskConfig: they are properties of a run of trades, not of an order.
+#   account limits:    NOT in this file. bots/_shared/monitor/account_limits.yaml holds the
+#                      account tier (equity, margin, stop-out, open positions across every
+#                      magic) at the strictest limit any bot on the account declares.
+#
+# Sources, in order of authority:
+#   1. bots/exness_fx_d1/BOT.md, "Kill criteria" (approved by the user 2026-09-06). The
+#      lettered criteria (a)..(f) and the retire rules are quoted next to what implements them.
+#   2. case_studies/exness_fx_d1/config/setup.yaml (universe, decision, costs, execution).
+#   3. The phase-5 measurements in BOT.md (validation vol, turnover, book geometry).
+#
+# STATE OF THE BOT ON 2026-09-08: phase 5 has NO survivor in any of its three cohorts
+# (long-only top-k, long-short sleeves, per-pair time-series percentile; 0 of 1,068 in each is
+# significant at 0.95 on the active return, K = 3,204), phase 6 is not opened and the holdout
+# (2025-09-01 .. 2026-08-31) is UNSCORED. There is no deployable signal. shadow_mode is true,
+# armed is false, and the loop refuses to send an order unless a person arms it in the session
+# AND a model is named. This file says what the limits WILL be; it is not a permission to trade.
+
+bot_id: exness_fx_d1
+case_study: exness_fx_d1
+
+# Magic number. The allocation table is bots/_shared/__init__.py::MAGIC_ALLOCATION and this
+# value is checked against it at startup; 202500 (the retired legacy bot) is reserved.
+magic: 260901
+
+execution:
+  # "paper" makes MT5Broker.assert_paper_trading refuse a non-demo account, at connect and
+  # before every order. "live" additionally needs armed_live=True from a person and refuses a
+  # demo account. Paper is the only value this bot may carry until phase 7 passes.
+  mode: paper
+  # THE DEFAULT OF EVERY RUN (the SUBMIT_ORDERS=False of 25_live_trading/02:121 and
+  # 11_fx_deployment_loop.py:134). Arming is a command-line flag a person types for one
+  # session; it is never written true here.
+  armed: false
+  # Slippage the terminal may take before rejecting the deal, in points. The legacy connector
+  # used 20 opening / 30 closing; one point on a 5-digit major is 0.1 pip, so 20 points is
+  # 2 pips - about 3x the measured in-session spread (0.63..1.28 bps of mid).
+  deviation_points: 20
+  close_deviation_points: 30
+  # Refuse an order whose order_calc_margin exceeds this fraction of margin_free. Unknown
+  # margin fails closed (MT5Broker.margin_check).
+  max_margin_fraction: 0.20
+  # An order that rounds below volume_min (0.01) is rejected, never bumped up.
+  min_lot_policy: reject
+
+capital:
+  # Capital this bot is allocated, in account currency.
+  #
+  # MEASURED 2026-09-07, read-only, on the demo login Exness-MT5Trial7 (206539306):
+  # balance 899.40 USD, equity 898.56, margin 0.88, margin_free 897.68, leverage 1:2000,
+  # margin_so_call 60 %, margin_so_so 0.0 (the terminal reports NO stop-out level, so the
+  # declared fallback applies). BOT.md's earlier figure of 10,000 USD was the 2026-09-05
+  # reading and is stale: the account has been drawn down since, and one position carrying
+  # the RETIRED legacy bot's magic 202500 is open on it (open question 3).
+  #
+  # setup.yaml::execution.initial_cash (100,000) is the RESEARCH notional and is deliberately
+  # not reused: the research book is scale-free, a live book is not.
+  #
+  # STALE AGAIN, NOTED NOT ACTED ON (2026-09-10): the legacy V9 bot (magic 202500) was stopped
+  # today on this same demo login and the demo equity was read at 10,891.15 USD -- a THIRD
+  # figure after the 2026-09-05 10,000 and the 2026-09-07 898.56 above, moving in the opposite
+  # direction this time. `allocated` below is left at 900.0 on purpose: raising it is a funding
+  # decision for the user (same rule as `min_viable_allocated` below), not a value the builder
+  # sets from a read-only measurement. A fresh `capital_viability` read-only pass against
+  # 10,891.15 is owed before the next paper cycle, not performed here.
+  allocated: 900.0
+  currency: USD
+  # The book phase 5 traded: equal-weight top-k long-short. One leg is 1/k of allocated
+  # capital per side, so at k=1 a leg is 100 % of allocated.
+  design_top_k: 1
+  design_leg_fraction: 1.0
+  # THE GRANULARITY FLOOR, AND WHY THIS ACCOUNT CANNOT CURRENTLY FUND THIS BOT:
+  # volume_min 0.01 lots x trade_contract_size 100,000 = 1,000 units of base currency, and
+  # normalize_lot (bots/_shared/mt5_broker.py) rounds DOWN and REJECTS anything below
+  # volume_min - a leg below the floor is refused, never silently shrunk. At 900 USD a k=1
+  # EURUSD leg is 900 / 1.1629 = 774 units = 0.0077 lots, WHICH ROUNDS TO ZERO. So at this
+  # allocation the loop produces no order at all, and it says so: `capital_viability` in
+  # every run record reports `viable: false` with the arithmetic, and staging is blocked.
+  #
+  # Minimum viable allocation, at the prices measured 2026-09-07 (EURUSD 1.1629,
+  # USDJPY 154.309): k=1 needs one 0.01-lot leg per side, i.e. >= 1,000 units, i.e.
+  # >= ~1,163 USD; k=2 halves each leg, so >= ~2,326 USD. With a safety multiple of 2 on the
+  # lot step so a rotation is not knife-edge, a paper cycle wants at least ~2,400 USD.
+  # Raising this is a funding decision for the user, not a code change.
+  min_viable_allocated: 2400.0
+  min_lots: 0.01
+  contract_size: 100000
+
+# --------------------------------------------------------------------------------------
+# ml4t.live.LiveRiskConfig — the PRE-TRADE controls of 25_live_trading/10_safety_risk_demo
+# --------------------------------------------------------------------------------------
+# `ml4t.live.safety.LiveRiskConfig` carries the per-order and per-position limits AND the
+# loss limits (`max_daily_loss`, `max_drawdown_pct`, safety.py:114-116). Kill criterion (a)
+# maps straight onto `max_drawdown_pct: 0.08`, and the derived daily loss onto
+# `max_daily_loss`, so SafeBroker refuses the order before it is sent. The matching breakers
+# in `breakers:` below are the SECOND tier, not a replacement: a breaker adds the state
+# machine, the event log, the HALF_OPEN probe and the kill switch that latches across a
+# restart, none of which a config field has.
+live_risk_config:
+  # ONE SWITCH, NOT TWO. `ml4t.live.ExecutionMode` is shadow | paper | live (safety.py:63-68)
+  # and `__post_init__` DERIVES `shadow_mode` from it (safety.py:153-160) - setting both, with
+  # `shadow_mode: true` next to a non-shadow mode, raises `ExecutionModeError`. So
+  # `shadow_mode` is deliberately absent from this file: there is nothing here to get out of
+  # step with itself. `shadow` = orders are logged into a VirtualPortfolio and never reach the
+  # adapter; it is the class's own recommended starting point (safety.py:96-100) and stays
+  # until phase 7 passes (README, "What is not allowed").
+  #
+  # Note the two layers carry DIFFERENT values on purpose: this is the SafeBroker layer and it
+  # is `shadow`, while `execution.mode` above is the BROKER layer and it is `paper`. The
+  # broker layer must say `paper` because `MT5Broker._guard_mode` branches on it
+  # (mt5_broker.py:461-467): `paper` runs `assert_paper_trading()` and proves the account is a
+  # demo; anything else demands `armed_live` and raises `NotArmedError`. So if an order ever
+  # did get past SafeBroker, it would still have to prove the account is a demo.
+  execution_mode: shadow
+
+  # -- order size -----------------------------------------------------------------------
+  # These are CEILINGS in units and account currency, not the size the bot trades; the size
+  # comes from capital.allocated and the book's weights. They are derived against the MINIMUM
+  # VIABLE allocation (capital.min_viable_allocated = 2,400 USD), not against today's 900, so
+  # topping the account up to a workable balance does not silently loosen them:
+  #   a k=1 leg at 2,400 USD on EURUSD is ~2,064 units (0.02 lots); 4,000 units (0.04 lots)
+  #   is roughly 2x that - headroom for a rotation that opens before the other leg has
+  #   closed, small enough that a sizing bug cannot build a lot-sized position.
+  # Quantities are UNITS of base currency (lots x trade_contract_size), the convention of
+  # setup.yaml::execution.share_type: integer; the adapter converts to lots.
+  # RAISING capital.allocated ABOVE min_viable_allocated MEANS RE-DERIVING THESE FOUR.
+  max_order_shares: 4000
+  # The same 4,000 units in account currency at the most expensive pair in the universe
+  # (GBPUSD ~1.35 -> 5,400 USD; USDJPY is quoted in JPY so one unit is 1 USD).
+  max_order_value: 6000.0
+
+  # -- position size --------------------------------------------------------------------
+  # One pair carries at most one leg of the book, so the position cap equals the order cap.
+  max_position_shares: 4000
+  max_position_value: 6000.0
+  # The five pairs of universe.symbols; the book never holds a name outside them.
+  max_positions: 5
+  # Gross exposure of the book in account currency. The design book is 2x allocated gross
+  # (one long leg + one short leg at k=1); 9,600 = 4x min_viable_allocated is twice that,
+  # which a one-legged rotation can reach transiently (BOT.md open question 23). Far below
+  # what 1:2000 leverage would allow.
+  max_total_exposure: 9600.0
+
+  # -- rate ------------------------------------------------------------------------------
+  # ONE DECISION A DAY. A full rotation of the k=1 long-short book is 2 closes + 2 opens = 4
+  # orders. Four is therefore the whole day's budget and anything above it is a loop bug.
+  max_orders_per_minute: 4
+
+  # -- loss limits: kill criteria enforced BEFORE the order is sent ------------------------
+  # Kill criterion (a) verbatim. `__post_init__` validates the open interval 0 < x < 1
+  # (safety.py:176-182). The second tier is DrawdownBreaker in monitor/circuit_breakers.py.
+  max_drawdown_pct: 0.08
+  # 2 % of the minimum viable allocation (2,400 USD) = 48 USD, in account currency. BOT.md's
+  # criteria name a daily loss but no number, so it is derived and recorded (Decisions log
+  # 2026-09-07): the phase-5 generation-2 winner ran at 12.9 % annualised volatility = 0.81 %
+  # a session, so 2 % is about 2.5 standard deviations of one session. The authoritative rule
+  # is DailyLossBreaker below, which works in PERCENT and so does not go stale when the
+  # allocation changes; this absolute figure is only the pre-trade second line of defence.
+  max_daily_loss: 48.0
+
+  # -- data and fat finger -----------------------------------------------------------------
+  # A reference price this far from the order price is a stale or wrong quote. The median
+  # absolute one-day move of these pairs is 29.5 bps (BOT.md phase 1) and only 20 four-hour
+  # moves in 8.5 years exceeded 2 %; 1 % is above normal and below a gap.
+  max_price_deviation_pct: 0.01
+  # The decision is the 20:00 UTC bar close and the order goes at that bar's open, inside the
+  # New York session. A quote older than 15 minutes there means the feed is broken. The loop
+  # primes this guard with record_market_snapshot() from symbol_info_tick before every leg
+  # (mt5-exness-broker.md section 3).
+  max_data_staleness_seconds: 900
+  # One cycle a day: two identical orders inside a minute is a retry bug, not a decision.
+  dedup_window_seconds: 60
+
+  # -- universe -----------------------------------------------------------------------------
+  allowed_assets: [AUDUSD, EURUSD, GBPUSD, USDCAD, USDJPY]
+  blocked_assets: []
+
+  # -- persistence and latching ----------------------------------------------------------
+  # Kill criterion (d): "SafeBroker reconciliation finds an unexplained position".
+  fail_on_reconciliation_mismatch: true
+  # The kill switch is armed by a person or by a breaker, never by default; it latches across
+  # process restarts through the state file (25_live_trading/10:632-653).
+  kill_switch_enabled: false
+  allow_reducing_risk_when_killed: true
+  halt_on_reducing_risk_failure: true
+  # Relative to bots/exness_fx_d1/deploy/state/.
+  state_file: risk_state.json
+  journal_file: audit_journal.jsonl
+  fail_on_journal_error: true
+
+# --------------------------------------------------------------------------------------
+# CFD guards at the moment of execution (mt5-exness-broker.md section 4)
+# --------------------------------------------------------------------------------------
+# Kill criterion (c) is a monthly statistic; these are the per-order stop before it.
+cfd_guards:
+  # setup.yaml::costs.spread_bps_by_session "other" bucket = the 21:00-22:00 UTC gap after the
+  # New York close and the edges of the week: p50 0.63-4.82, p90 4.32-9.46 bps, three to
+  # seven times the in-session spread. The bot decides at 20:00 UTC and executes at that bar's
+  # open, so it should never be in this bucket; the guard exists because a delayed or replayed
+  # cycle would be, and a fill there costs several times what the backtest charged.
+  blocked_execution_windows_utc:
+    - {start: "21:00", end: "22:00", reason: "post-New-York gap, spread p90 4.3-9.5 bps"}
+  # Refuse a leg whose LIVE spread at the moment of execution exceeds the assumed p90 for that
+  # pair by more than this multiple. 2.0: the in-session p50 and p90 are within 0.02 bp of each
+  # other on every pair, so twice p90 is not noise, it is a news print or a session edge.
+  max_spread_multiple_of_p90: 2.0
+  # The measured in-session p90 per pair, bps of mid (setup.yaml::costs.spread_bps_by_session,
+  # new_york bucket, measured 2026-09-05 from 30 days of this account's ticks). Repeated here
+  # so the guard has a number even when a pair is missing from the session table.
+  assumed_spread_p90_bps:
+    EURUSD: 0.69
+    GBPUSD: 0.74
+    USDJPY: 0.64
+    AUDUSD: 1.28
+    USDCAD: 1.02
+  # FX trades Sun 21:00 -> Fri 21:00 server (derived from H1 bars, data/mt5/sessions_mt5.json).
+  # A weekend cycle stages nothing.
+  refuse_when_market_closed: true
+
+# --------------------------------------------------------------------------------------
+# Circuit breakers (26_mlops_governance/04), mapped to the written kill criteria
+# --------------------------------------------------------------------------------------
+breakers:
+  # How long a tripped breaker stays OPEN before it probes HALF_OPEN. This bot decides once a
+  # day, so a timeout shorter than a day would let a breaker clear itself before anyone read
+  # the alert. Kill criteria are pauses: the operator's procedure in README.md clears them.
+  recovery_timeout_hours: 24
+
+  # (a) "drawdown from peak > 8 % of allocated capital" -> DrawdownBreaker
+  drawdown:
+    max_drawdown_pct: 0.08
+  # daily loss, derived as above -> DailyLossBreaker
+  daily_loss:
+    max_daily_loss_pct: 0.02
+  # (b) "the rolling 63-session hit rate of the deployed book is below 0.5 for 21 consecutive
+  # sessions (an IC over five names is not a readable statistic)". This is a sliding-window
+  # rule that ConsecutiveLossBreaker cannot express, so monitor/circuit_breakers.py carries a
+  # RollingHitRateBreaker subclass for it.
+  hit_rate:
+    window_sessions: 63
+    min_hit_rate: 0.5
+    consecutive_sessions: 21
+  # (c) "the realised round-trip cost on the demo/live tape exceeds 1.5x the assumed 2.6 bp for
+  # a calendar month". 2.6 bp = 2 x the top of setup.yaml::costs.spread_bps.major_pairs (1.3),
+  # the round trip 01_feasibility_analysis prices. The realised figure is read from the deal
+  # history through bots/_shared/costs_mt5.py, not from the engine.
+  cost:
+    assumed_round_trip_bps: 2.6
+    multiple: 1.5
+    window_days: 31
+    min_round_trips: 10   # below this the monthly average is noise, so the breaker abstains
+  # (f) "the realised swap per night exceeds the value declared in setup.yaml::costs.swap for a
+  # week". The declared value is 0.0 points per lot per night on every pair, read from
+  # symbol_info on the DEMO account; the real Pro account must be re-read before any paper
+  # cycle (BOT.md user decision 5, open question 1).
+  swap:
+    declared_points_per_lot_per_night: 0.0
+    tolerance_points: 0.5
+    consecutive_nights: 7
+  # A pause the kill criteria do not name, declared here (Decisions log 2026-09-07): five
+  # consecutive losing round trips. At the book's measured hit rate near 0.5 the chance of
+  # five in a row is 1/32, so this fires about once per 32 closed trades by chance - a pause,
+  # not a retirement, which is why it probes HALF_OPEN rather than retiring the bot.
+  consecutive_loss:
+    max_consecutive: 5
+  # Infrastructure, not one of the lettered criteria: an order_send round trip that slows down
+  # means the terminal or the bridge is in trouble.
+  latency:
+    max_latency_ms: 2000.0
+    n_recent: 10
+
+# --------------------------------------------------------------------------------------
+# (e) A MISSING DECISION BAR IS NOT A BREAKER — it is a day the bot does not trade
+# --------------------------------------------------------------------------------------
+# BOT.md kill criterion (e) and open question 9. On 2018-01-31 the 16:00 UTC bar was missing
+# on every pair and the research panel dropped the session; live must do the same. One missing
+# bar is an outage and pausing the bot for a day because the broker skipped a bar would be an
+# over-reaction; a RUN of them is a broken feed. So the loop counts and logs, and only
+# escalates to a breaker after `escalate_after` missing decisions inside `window_sessions`.
+missing_decision_bar:
+  action: no_trade_today
+  escalate_after: 3
+  window_sessions: 21
+
+# --------------------------------------------------------------------------------------
+# Retire rules (BOT.md kill criteria, second sentence) — not breakers: they end the bot
+# --------------------------------------------------------------------------------------
+# Neither input exists yet (16_costs has not run, the holdout is unscored), so monitor/
+# retire.py reports `not_computable` with the reason instead of defaulting to a pass.
+retire:
+  # "the latest re-estimate of the breakeven cost (16_costs) is below the measured p90 spread"
+  min_breakeven_cost_bps: 1.28   # p90 in-session spread across the five pairs, 2026-09-05
+  # "the holdout PSR against the 1/N book is below 0.5"
+  min_holdout_psr_vs_benchmark: 0.5
+
+# --------------------------------------------------------------------------------------
+# Decision-bar guard (BOT.md open question 9) — research and live must apply the same rule
+# --------------------------------------------------------------------------------------
+decision:
+  # Mirrors setup.yaml::decision. The loop asserts the two agree and refuses to run when they
+  # do not, so a change to the research snapshot cannot leave the live loop behind. The rule
+  # itself is not re-implemented: the loop calls
+  # case_studies/exness_fx_d1/_features.session_panel(..., keep_decision_ts=True).
+  snapshot: h4_close_2000utc
+  snapshot_utc: "20:00"
+  session_calendar: CME_FX
+  session_close_tolerance_minutes: 240
+
+# --------------------------------------------------------------------------------------
+# Evidence boundary — enforced by the loop, not by good intentions
+# --------------------------------------------------------------------------------------
+evidence_boundary:
+  # setup.yaml::evaluation.holdout_start. While `holdout_scored` is false the loop clamps any
+  # deployment refit to end strictly before this date and ASSERTS it, and the parity replay
+  # reports the order tape only - no return, no Sharpe. 25_live_trading/02 deliberately
+  # extends its data past the frozen cut ("this notebook is the one place..."); this bot may
+  # not, because that cut is an unscored holdout.
+  holdout_start: '2025-09-01'
+  holdout_end: '2026-08-31'
+  # Written by the holdout stages when they have run. Until then the file is absent.
+  holdout_scored_marker: state/holdout_scored.json
+
+# --------------------------------------------------------------------------------------
+# Model — what the loop is allowed to deploy
+# --------------------------------------------------------------------------------------
+model:
+  # A registered training-run hash from the experiment registry, or null. NULL IS THE DEFAULT
+  # AND THE HONEST VALUE TODAY: phase 5 produced no survivor, so no model is deployable. With
+  # null the loop runs steps 1, 2, 5 and 6 off the registered validation predictions if asked,
+  # otherwise stops and says why. --model overrides this for one run.
+  training_hash: null
+  label: null
+  # The validation prediction population the plumbing test may replay. Registered, complete,
+  # validation-only: no refit, no data extension, no holdout read.
+  plumbing_prediction_population: 'exness_fx_d1:validation-predictions'
+  plumbing_population_hash: '930dcbfa4e57'
+  # Top-k of the equal-weight long-short book and whether both sleeves trade. The sweep's own
+  # parameters (setup.yaml::backtest.sweep.top_k_grid), repeated because the live book has to
+  # be the book that was backtested.
+  top_k: 1
+  long_short: true
+  # Refit cadence in calendar days. The research folds are 3 years train / 1 year validate; a
+  # monthly refit keeps the deployment fit inside the same geometry without retraining every
+  # bar (25_live_trading/02, "Retrain cadence is monthly, not per-prediction").
+  refit_every_days: 31
+  # The trial count every run record stamps, so a number read off a live tape can never be
+  # compared with a backtest without the multiple-testing context (BOT.md, Trials table).
+  # Updated 2026-09-10: generation 3 closed the phase-5 gate at K = 5,340 (3,204 + the
+  # generation-3 population of 2,136, declared in GEN3_DECLARATION_2026-09-10.md before either
+  # fit ran); still no deployable model (phase 5 NOT MET, mentor gate verdict, BOT.md phase 5).
+  trial_count_at_deployment: 5340

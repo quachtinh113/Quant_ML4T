@@ -1,0 +1,19 @@
+{
+  "config_name": "tabm_s",
+  "family": "tabular_dl",
+  "feature_sets": [
+    "financial",
+    "model_based"
+  ],
+  "label": "fwd_ret_1d",
+  "library": "tabm",
+  "n_folds": 8,
+  "seed": 42,
+  "checkpoint_interval": 25,
+  "n_epochs": 200,
+  "params": {
+    "dropout": 0.1,
+    "hidden_dim": 64,
+    "n_members": 4
+  }
+}

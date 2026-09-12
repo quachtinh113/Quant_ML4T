@@ -1,0 +1,351 @@
+# exness_gold_sess — deployment risk configuration
+#
+# Read by bots/exness_gold_sess/deploy/deployment_loop.py and split across three layers,
+# because a limit put in the wrong layer is not enforced by the thing meant to enforce it:
+#
+#   live_risk_config:  ml4t.live.LiveRiskConfig — PRE-TRADE controls SafeBroker applies to each
+#                      order before it reaches the adapter (25_live_trading/10_safety_risk_demo).
+#   breakers:          this bot's own circuit breakers (26_mlops_governance/04), on the shared
+#                      CLOSED/OPEN/HALF_OPEN machine in bots/_shared/monitor/base.py. Drawdown,
+#                      hit rate, cost, swap and consecutive losses live HERE, not in
+#                      LiveRiskConfig: they are properties of a RUN OF TRADES, not of an order.
+#   account limits:    NOT in this file. bots/_shared/monitor/account_limits.yaml holds the
+#                      account tier (equity, margin level, stop-out distance, open positions and
+#                      orders across EVERY magic) at the strictest limit any bot on the login
+#                      declares. One trip there halts every bot; this file cannot relax it.
+#
+# Sources, in order of authority:
+#   1. bots/exness_gold_sess/BOT.md, "Kill criteria". *** THOSE ARE STILL A DRAFT AWAITING THE
+#      USER. *** Every threshold below that implements a lettered criterion is marked
+#      `pending_user_approval: true` and the loop refuses to arm while any of them is.
+#   2. case_studies/exness_gold_sess/config/setup.yaml (universe, decision, costs, execution).
+#   3. bots/exness_gold_sess/PHASE1_SPEC_MENTOR.md section 3.3 (which fields must be declared)
+#      and PRICE_GRID_DECLARATION.md section 3.4 (why this bot trades TWO SLEEVES, not one
+#      pooled book).
+#
+# STATE OF THE BOT ON 2026-09-08 — read this before anything below is treated as a permission:
+#   * Phases 1-3 are met. Phase 4 has NOT run: run_log/ is empty, no model is fitted, no
+#     prediction set exists, and K = 0 trials have been spent.
+#   * The holdout (2025-09-01 .. 2026-08-31) is UNSCORED, and it carries a declared
+#     contamination flag (the legacy v9 bot traded XAUUSD on this same login through it), so
+#     when it is scored it may CONFIRM and may not SELECT.
+#   * The price grid does not yet express the 8-hour hold; PRICE_GRID_DECLARATION.md is the fix
+#     and it has not landed.
+#   * The hypothesis and the kill criteria are the mentor's DRAFT and the user has not approved
+#     them.
+# THERE IS NO DEPLOYABLE SIGNAL. shadow_mode is true, armed is false, model is null, and the
+# loop refuses to stage an order. This file says what the limits WILL be. It is not permission.
+
+bot_id: exness_gold_sess
+case_study: exness_gold_sess
+
+# Magic number. The single allocation table is bots/_shared/__init__.py::MAGIC_ALLOCATION and
+# this value is asserted against it at startup (bots/tests/test_magic_numbers.py also asserts
+# that no two deploy/risk_config.yaml files in the repository share one). 202500 — the retired
+# legacy V9 Continuum bot — is reserved and never reallocated, so a stray position carrying it
+# stays recognisable as not ours.
+magic: 260903
+
+# The default of every run: dry run. bot-template.md:82.
+shadow_mode: true
+
+execution:
+  # "paper" makes MT5Broker.assert_paper_trading refuse a non-demo account, at connect and
+  # before every order. "live" additionally needs armed_live=True from a person, in this
+  # session, and refuses a demo account. Paper is the only value this bot may carry until
+  # phase 7 has been scored and the user has approved the kill criteria.
+  mode: paper
+  # THE DEFAULT OF EVERY RUN (the SUBMIT_ORDERS=False of 25_live_trading/02:121 and
+  # 11_fx_deployment_loop.py:134). Arming is a command-line flag a person types for one
+  # session; it is never written true in this file.
+  armed: false
+  # Slippage the terminal may take before rejecting the deal, in POINTS of the symbol.
+  # setup.yaml::costs.contract.point is 0.001 on both metals, so 20 points is 0.02 USD on gold
+  # (about 0.2 bps at 4,000 USD/oz) and 0.02 USD on silver (about 5 bps at 40 USD/oz).
+  # Silver's quoted spread is 30 points, so 20 points is TIGHTER than one spread there: the
+  # per-symbol override exists because one number cannot serve both metals.
+  deviation_points: {XAUUSD: 20, XAGUSD: 40}
+  close_deviation_points: {XAUUSD: 30, XAGUSD: 60}
+  # Refuse an order whose order_calc_margin exceeds this fraction of margin_free. An unknown
+  # margin fails CLOSED (MT5Broker.margin_check).
+  max_margin_fraction: 0.20
+  # An order that rounds below volume_min is rejected, never bumped up (MT5Broker.normalize_lot
+  # rounds DOWN; the legacy bump-up is opt-in and is not opted into).
+  min_lot_policy: reject
+
+# ---------------------------------------------------------------------------------------
+# UNITS. Everything in live_risk_config below that says "shares" is measured in OUNCES.
+#
+# setup.yaml::execution.share_type is `integer` and the engine's unit is
+# lots x trade_contract_size, which on these two symbols is an ounce:
+#     XAUUSD  volume_min 0.01 x contract_size 100  = 1 oz   -> every integer is placeable
+#     XAGUSD  volume_min 0.01 x contract_size 5000 = 50 oz  -> ONLY MULTIPLES OF 50 are placeable
+#
+# THE XAG GRANULARITY CONSTRAINT, written down because it is the kind of thing that is only
+# discovered live: a backtest can fill 73 oz of silver, and that volume cannot be sent. The
+# adapter's normalize_lot rounds DOWN, so 73 oz becomes 50 oz — a 32 % under-fill — and 40 oz
+# becomes 0 and is REJECTED. On this account's measured equity (about 900 USD) one 50 oz lot of
+# silver is roughly 50 x 40 = 2,000 USD of notional, so silver is not sizeable at all at the
+# current balance without leverage the account tier would refuse. Consequences, all declared
+# here rather than discovered:
+#   * every silver target is floored to a multiple of 50 BEFORE it reaches SafeBroker;
+#   * a silver target below 50 oz is a NO-TRADE for that sleeve, not a rounded-up trade;
+#   * the divergence between the backtest's fill and the live fill is measured and asserted in
+#     bots/exness_gold_sess/tests/test_parity.py (PHASE1_SPEC_MENTOR.md section 2.e item 5);
+#   * if phase 6 keeps XAGUSD in the universe, capital.min_viable_allocated below is what has
+#     to be true before the silver sleeve can be traded at all.
+# ---------------------------------------------------------------------------------------
+contract:
+  # From MT5 symbol_info, re-read at startup and asserted against these values. Never assumed:
+  # mt5-exness-broker.md requires symbol names, contract sizes and swaps to be READ.
+  contract_size: {XAUUSD: 100, XAGUSD: 5000}
+  volume_min: 0.01
+  volume_step: 0.01
+  point: {XAUUSD: 0.001, XAGUSD: 0.001}
+  # units = lots x contract_size; the smallest placeable order in engine units (ounces).
+  min_units: {XAUUSD: 1, XAGUSD: 50}
+  # Market Watch names on this Exness account carry the suffix `m`. The mapping lives in
+  # bots/_shared/mt5_broker.py::SYMBOL_MAP; it is repeated here only so a reader can see that
+  # the bare names above are not what is sent.
+  market_watch_suffix: m
+
+capital:
+  # MEASURED read-only 2026-09-07 on the demo login 206539306 @ Exness-MT5Trial7 (trade_mode 0,
+  # USD, leverage 1:2000, margin_so_call 60 %, margin_so_so 0.0 — this terminal reports NO
+  # stop-out level, which is what bots/_shared/monitor/account_limits.yaml's
+  # fallback_stop_out_pct exists for): balance 899.40 USD, equity 898.56.
+  allocated: 450.0
+  currency: USD
+  # WHY HALF THE ACCOUNT AND NOT ALL OF IT: xau_fx_mt5 (magic 260905) trades XAUUSD on this
+  # same login. The account-tier breaker stops every bot at once, so this bot's exposure must
+  # be set so that the SUM of the two bots stays under it (BOT.md, Kill criteria, last
+  # paragraph). Half is a declared split, not a measurement; when the other bot declares its
+  # own allocation the two must be reconciled in bots/README.md.
+  #
+  # Whether this is enough to trade at all: NOT YET ESTABLISHED, and the number below says what
+  # would have to be true. One gold ounce at ~4,000 USD is ~4,000 USD of notional and needs
+  # ~2 USD of margin at 1:2000, so gold is sizeable in 1 oz steps at this balance. Silver is
+  # not: one placeable lot is 50 oz ~ 2,000 USD of notional, more than four times the
+  # allocation. Phase 6 decides whether XAGUSD stays in the universe at all
+  # (PHASE1_SPEC_MENTOR.md section 2.e item 4); this file does not pre-empt that decision, it
+  # records what the constraint is.
+  min_viable_allocated_for_xag: 4000.0
+  # The two sleeves. PRICE_GRID_DECLARATION.md section 3.4: the broker holds ONE NET POSITION
+  # PER SYMBOL, so a New York entry landing inside a London hold would be an adjustment and not
+  # a new position, and the time-exit rule would close the whole thing at 17:00 and kill the
+  # New York leg after three hours. The pooled `both` book therefore does not exist as an
+  # engine book and does not exist here either: this bot runs the two sessions as two sleeves,
+  # each with its own half of the allocation, and the pooled result is their deterministic sum.
+  sleeves:
+    london: 0.5
+    ny: 0.5
+
+# ---------------------------------------------------------------------------------------
+# ml4t.live.LiveRiskConfig — every field the dataclass declares, so nothing falls back to a
+# library default this bot never chose. PHASE1_SPEC_MENTOR.md section 3.3.
+#
+# EVERY NUMERIC LIMIT BELOW IS PROVISIONAL AND MARKED. They are derived from the allocation and
+# the contract geometry, NOT from any backtest, because there is no backtest: phase 5 has not
+# run. When it does, the position limits must be re-derived from the measured position sizes
+# and the measured volatility, and the change recorded in BOT.md.
+# ---------------------------------------------------------------------------------------
+live_risk_config:
+  # 'shadow' logs the order and sends nothing. It is what the loop uses unless a person passes
+  # --arm, and it is what this file declares so that a run started with no flags cannot trade.
+  execution_mode: shadow
+  shadow_mode: true
+
+  # --- Per-order limits -----------------------------------------------------------------
+  # OUNCES. 20 oz of gold at ~4,000 USD is ~80,000 USD of notional, which is far more than this
+  # allocation can margin; the binding limit is max_order_value below, and this one exists so
+  # that a unit-conversion bug (lots read as ounces, or the reverse by a factor of 100) is
+  # refused rather than sent. A single silver lot is 50 oz, so any value under 50 would make
+  # silver unplaceable by this limit rather than by the granularity rule, which would hide the
+  # real reason.
+  max_order_shares: 100
+  # USD. One third of the allocation per order.
+  max_order_value: 150.0
+  max_orders_per_minute: 4
+
+  # --- Per-position limits --------------------------------------------------------------
+  # OUNCES, per symbol.
+  max_position_shares: 100
+  # USD, per symbol.
+  max_position_value: 300.0
+  # Two metals x two sleeves = 4 legs at most, and the sleeves net per symbol, so 2. Set at 4
+  # so that a reconciliation finding more than the design allows trips rather than passes.
+  max_positions: 4
+
+  # --- Book limits ----------------------------------------------------------------------
+  # USD gross notional across this bot's magic. Must stay well under the account tier's
+  # max_gross_notional (9,000 USD across EVERY magic, bots/_shared/monitor/account_limits.yaml)
+  # with room for xau_fx_mt5 beside it.
+  max_total_exposure: 600.0
+
+  # --- Loss limits ----------------------------------------------------------------------
+  # BOT.md kill criterion (a): drawdown from peak > 8 % of the capital allocated to the bot.
+  # DRAFT — the user has not approved it.
+  max_drawdown_pct: 0.08
+  # 2 % of the allocation, the same daily rule the account tier carries at its strictest.
+  # 0.02 x 450 = 9.00 USD.
+  max_daily_loss: 9.0
+
+  # --- Data and staleness ---------------------------------------------------------------
+  # SafeBroker refuses an order whose last recorded market snapshot is older than this, so
+  # deploy/deployment_loop.py MUST call safe_broker.record_market_snapshot(symbol, price) from
+  # a fresh symbol_info_tick before every order (25_live_trading/10_safety_risk_demo.py:352-354,
+  # mt5-exness-broker.md section 3). 900 s = 15 minutes: the decision is the close of an H1 bar
+  # and the order goes at the next bar's open, so a snapshot older than a quarter of an hour
+  # means the loop stalled and the price it sized on is not the price it would get.
+  max_data_staleness_seconds: 900
+  # Refuse an order whose price differs from the recorded snapshot by more than this. 1 % on
+  # gold is ~40 USD/oz — larger than any normal session move and smaller than a gap through the
+  # daily 21:00-22:00 UTC break, which is kill criterion (g).
+  max_price_deviation_pct: 0.01
+  # Two decisions a day, so two orders per symbol per day at most. A duplicate inside a minute
+  # is a retry loop, not a decision.
+  dedup_window_seconds: 60
+
+  # --- Universe -------------------------------------------------------------------------
+  # setup.yaml::universe.symbols. Bare names; the adapter applies the `m` suffix.
+  allowed_assets: [XAGUSD, XAUUSD]
+  blocked_assets: []
+
+  # --- Failure behaviour ----------------------------------------------------------------
+  # BOT.md kill criterion (d): a position carrying magic 260903 that the bot cannot explain is
+  # a stop, not a warning.
+  fail_on_reconciliation_mismatch: true
+  # The persistent kill switch. False here means "not tripped", not "disabled": the breakers in
+  # monitor/circuit_breakers.py set it, and once set it survives a restart.
+  kill_switch_enabled: false
+  allow_reducing_risk_when_killed: true
+  halt_on_reducing_risk_failure: true
+  # Relative to deploy/state/.
+  state_file: risk_state.json
+  journal_file: audit_journal.jsonl
+  fail_on_journal_error: true
+
+# ---------------------------------------------------------------------------------------
+# CFD and session guards specific to two metals on an Exness MT5 server running UTC+0.
+# ---------------------------------------------------------------------------------------
+cfd_guards:
+  # setup.yaml::decision.no_trade_buckets. Measured 2026-09-07: the `other` session bucket is
+  # EMPTY on both metals — they stop quoting during the daily break and Sydney opens at 22:00
+  # UTC — so there is no spread measurement for it and no order may be placed there.
+  blocked_execution_windows_utc:
+    # The daily maintenance break. It is 21:00-22:00 UTC while the US is on DST and 22:00-23:00
+    # when it is not, so exactly one of the 21:00 / 22:00 bars prints on a given day. BOT.md
+    # kill criterion (g) is about holding THROUGH this window; this guard is about not placing
+    # an order INSIDE it.
+    - {from: "21:00", to: "23:00", reason: "daily server break; exactly one of these two hours has no quote"}
+  # Refuse to stage anything when symbol_info says the market is closed, rather than sending an
+  # order that will be rejected with a code a reader has to look up.
+  refuse_when_market_closed: true
+  # Kill criterion (e): if the decision bar is missing within tolerance, do not place an order
+  # that session. Counted, not silently skipped.
+  missing_decision_bar:
+    action: no_trade_session
+    escalate_after: 3
+    window_sessions: 21
+
+# ---------------------------------------------------------------------------------------
+# Circuit breakers — one per lettered kill criterion of BOT.md. Implemented in
+# bots/exness_gold_sess/monitor/circuit_breakers.py on the shared state machine.
+#
+# *** EVERY THRESHOLD HERE IS FROM THE MENTOR'S DRAFT KILL CRITERIA AND THE USER HAS NOT
+# APPROVED THEM. `pending_user_approval: true` below is read by the deployment loop, which
+# refuses --arm while it is set. Remove it only when the user has approved the criteria, and
+# record the approval date in BOT.md. ***
+# ---------------------------------------------------------------------------------------
+breakers:
+  pending_user_approval: true
+  # A day: the bot decides twice a day, so a halt that cleared itself inside one cycle would
+  # never be seen by a person.
+  recovery_timeout_hours: 24
+
+  # (a) drawdown from peak > 8 % of allocated capital
+  drawdown:
+    max_drawdown_pct: 0.08
+    tier: portfolio
+    kill_criterion: "a"
+
+  # derived from (a): 2 % of allocation in one day
+  daily_loss:
+    max_daily_loss_pct: 0.02
+    tier: portfolio
+    kill_criterion: "a (derived)"
+
+  # (b) rolling 63-decision hit rate of the running book below 0.5 for 21 consecutive sessions.
+  # BOT.md is explicit about WHY it is hit rate and not IC: "IC tren hai ten khong phai mot
+  # thong ke doc duoc" — an IC over two names is not a readable statistic, which is the same
+  # fact 05_evaluation and _model_reading.py record on the research side.
+  hit_rate:
+    window_decisions: 63
+    floor: 0.5
+    consecutive_sessions: 21
+    tier: strategy
+    kill_criterion: "b"
+
+  # (c) realised round-trip cost above 1.5x the assumed cost for one calendar month.
+  # Assumed cost = setup.yaml::costs.spread_bps_by_session.round_trip_p90_bps, PER SYMBOL,
+  # because silver is 7.7x gold in bps and one pooled number would hide a silver blow-out
+  # behind gold's tightness.
+  cost:
+    multiple_of_assumed: 1.5
+    assumed_round_trip_bps: {XAUUSD: 1.2, XAGUSD: 9.4}
+    window: calendar_month
+    tier: strategy
+    kill_criterion: "c"
+
+  # (d) reconciliation finds an unexplained position carrying magic 260903
+  reconciliation:
+    action: halt_immediately
+    tier: system
+    kill_criterion: "d"
+
+  # (f) realised nightly swap above the value declared in setup.yaml::costs.swap for a week.
+  # The declared value is 0.0 on BOTH metals, read from symbol_info on the DEMO account on
+  # 2026-09-07. A demo reading is not the Pro account's reading, and swap_mode is 1 (points),
+  # so this breaker is armed against a number that must be re-read on the real account before
+  # 16_costs runs. Until it is, `assumed_is_demo_reading: true` is what tells a reader that a
+  # trip here may be the assumption's fault and not the market's.
+  swap:
+    points_per_lot_per_night: {XAUUSD: {long: 0.0, short: 0.0}, XAGUSD: {long: 0.0, short: 0.0}}
+    assumed_is_demo_reading: true
+    window_nights: 7
+    tier: strategy
+    kill_criterion: "f"
+
+  # (g) a metal halts or gaps through the daily 21:00-22:00 UTC break while the bot still holds.
+  # This is the metals-specific risk (bots/assets/XAUUSD.md:110) and it has no counterpart in
+  # the FX bot's breaker set.
+  overnight_gap:
+    max_gap_pct_through_break: 0.01
+    tier: portfolio
+    kill_criterion: "g"
+
+  # Not a lettered criterion; the generic trade-tier guards of 26/04.
+  consecutive_loss:
+    max_consecutive_losing_decisions: 10
+    tier: trade
+  latency:
+    max_cycle_seconds: 120
+    tier: system
+
+# ---------------------------------------------------------------------------------------
+# Retirement — BOT.md, "Nghi huu khi ...". Both inputs are missing today (16_costs has not run
+# and the holdout is unscored), so monitor/retire.py must report `not_computable` with the
+# reason rather than defaulting to a pass.
+# ---------------------------------------------------------------------------------------
+retire:
+  # Retire when the latest breakeven cost estimate from 16_costs falls below the measured p90
+  # spread of the session being traded. The reference is the ROUND TRIP at the p90, with the
+  # safety margin setup.yaml::backtest.sweep.breakeven_gate.safety_margin declares (1.5).
+  min_breakeven_cost_bps: {XAUUSD: 1.8, XAGUSD: 14.1}   # 1.5 x round_trip_p90_bps
+  min_breakeven_source: "16_costs; NOT RUN — reports not_computable until it has"
+  # Retire when PSR on the holdout against the 1/N long-both-metals benchmark falls below 0.5.
+  min_holdout_psr_vs_benchmark: 0.5
+  holdout_benchmark: equal_weight_long_both_metals
+  holdout_status: "UNSCORED, and contaminated: the legacy v9 bot traded XAUUSD on this login
+    through 2025-09-01..2026-08-31 (setup.yaml::evaluation.legacy_v9_contaminated_window), so
+    the holdout may CONFIRM and may not SELECT"

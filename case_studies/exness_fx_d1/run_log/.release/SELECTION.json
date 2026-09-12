@@ -1,0 +1,14 @@
+{
+  "pin": "",
+  "helper_rank1": "d43230f42502",
+  "family": "linear",
+  "config_name": "lasso_f0.35",
+  "label": "fwd_ret_21d",
+  "notebook_rank1": "d43230f42502",
+  "carrier": "",
+  "matched_holdout": "e50554f931bb",
+  "anchors": [
+    "d43230f42502",
+    "e50554f931bb"
+  ]
+}

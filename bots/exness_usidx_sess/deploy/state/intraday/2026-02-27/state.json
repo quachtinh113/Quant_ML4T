@@ -1,0 +1,253 @@
+{
+  "started_at": "2026-09-12T07:28:49.853210+00:00",
+  "evidence": {
+    "bot_id": "exness_usidx_sess",
+    "spec": "intraday",
+    "phase5_survivors": 0,
+    "phase5_specs_scored": 1403,
+    "trial_count_K": 1780,
+    "phase6_opened": false,
+    "holdout_window": [
+      "2026-03-01",
+      "2026-08-31"
+    ],
+    "holdout_scored": false,
+    "kill_criteria_approved": false,
+    "live_trading_permitted": false,
+    "note": "0 survivors of 1,403 scored specs at K = 1,780; phase 6 not opened; holdout sealed. This package is a DRY RUN of the code path and is not evidence of an edge or permission to trade."
+  },
+  "config_source": "D:\\05_Quant\\ML_4_Bot\\bots\\exness_usidx_sess\\deploy\\risk_config.yaml",
+  "magic": 260902,
+  "breakers": {
+    "config_source": "D:\\05_Quant\\ML_4_Bot\\bots\\exness_usidx_sess\\deploy\\risk_config.yaml",
+    "pending_user_approval": true,
+    "kill_criteria_covered": {
+      "a": [
+        "strategy_drawdown"
+      ],
+      "b": [
+        "strategy_hit_rate_intraday",
+        "strategy_hit_rate_overnight"
+      ],
+      "c": [
+        "strategy_realised_cost"
+      ],
+      "d": [
+        "system_reconciliation"
+      ],
+      "e": [
+        "strategy_missing_decision_bar_intraday",
+        "strategy_overnight_fill_coverage"
+      ],
+      "f": [
+        "strategy_swap"
+      ],
+      "g": [
+        "system_trade_hours_dst"
+      ]
+    },
+    "evidence_boundary": {
+      "phase5_survivors": 0,
+      "phase5_specs_scored": 1403,
+      "trial_count_K": 1780,
+      "phase6_opened": false,
+      "holdout_scored": false,
+      "live_trading_permitted": false
+    },
+    "allows_trading": true,
+    "open": [],
+    "breakers": {
+      "strategy_drawdown": {
+        "name": "strategy_drawdown",
+        "tier": "portfolio",
+        "kill_criterion": "a",
+        "state": "CLOSED",
+        "trip_count": 0,
+        "trip_time": null,
+        "allows_trading": true,
+        "recovery_timeout_s": 86400.0
+      },
+      "strategy_daily_loss": {
+        "name": "strategy_daily_loss",
+        "tier": "portfolio",
+        "kill_criterion": null,
+        "state": "CLOSED",
+        "trip_count": 0,
+        "trip_time": null,
+        "allows_trading": true,
+        "recovery_timeout_s": 86400.0
+      },
+      "strategy_hit_rate_intraday": {
+        "name": "strategy_hit_rate_intraday",
+        "tier": "strategy",
+        "kill_criterion": "b",
+        "state": "CLOSED",
+        "trip_count": 0,
+        "trip_time": null,
+        "allows_trading": true,
+        "recovery_timeout_s": 86400.0
+      },
+      "strategy_hit_rate_overnight": {
+        "name": "strategy_hit_rate_overnight",
+        "tier": "strategy",
+        "kill_criterion": "b",
+        "state": "CLOSED",
+        "trip_count": 0,
+        "trip_time": null,
+        "allows_trading": true,
+        "recovery_timeout_s": 86400.0
+      },
+      "strategy_realised_cost": {
+        "name": "strategy_realised_cost",
+        "tier": "strategy",
+        "kill_criterion": "c",
+        "state": "CLOSED",
+        "trip_count": 0,
+        "trip_time": null,
+        "allows_trading": true,
+        "recovery_timeout_s": 86400.0
+      },
+      "system_reconciliation": {
+        "name": "system_reconciliation",
+        "tier": "system",
+        "kill_criterion": "d",
+        "state": "CLOSED",
+        "trip_count": 0,
+        "trip_time": null,
+        "allows_trading": true,
+        "recovery_timeout_s": 315360000.0
+      },
+      "strategy_missing_decision_bar_intraday": {
+        "name": "strategy_missing_decision_bar_intraday",
+        "tier": "strategy",
+        "kill_criterion": "e",
+        "state": "CLOSED",
+        "trip_count": 0,
+        "trip_time": null,
+        "allows_trading": true,
+        "recovery_timeout_s": 86400.0
+      },
+      "strategy_overnight_fill_coverage": {
+        "name": "strategy_overnight_fill_coverage",
+        "tier": "strategy",
+        "kill_criterion": "e",
+        "state": "CLOSED",
+        "trip_count": 0,
+        "trip_time": null,
+        "allows_trading": true,
+        "recovery_timeout_s": 86400.0
+      },
+      "strategy_swap": {
+        "name": "strategy_swap",
+        "tier": "strategy",
+        "kill_criterion": "f",
+        "state": "CLOSED",
+        "trip_count": 0,
+        "trip_time": null,
+        "allows_trading": true,
+        "recovery_timeout_s": 86400.0
+      },
+      "system_trade_hours_dst": {
+        "name": "system_trade_hours_dst",
+        "tier": "system",
+        "kill_criterion": "g",
+        "state": "CLOSED",
+        "trip_count": 0,
+        "trip_time": null,
+        "allows_trading": true,
+        "recovery_timeout_s": 86400.0
+      },
+      "trade_consecutive_loss": {
+        "name": "trade_consecutive_loss",
+        "tier": "trade",
+        "kill_criterion": null,
+        "state": "CLOSED",
+        "trip_count": 0,
+        "trip_time": null,
+        "allows_trading": true,
+        "recovery_timeout_s": 86400.0
+      },
+      "system_latency": {
+        "name": "system_latency",
+        "tier": "system",
+        "kill_criterion": null,
+        "state": "CLOSED",
+        "trip_count": 0,
+        "trip_time": null,
+        "allows_trading": true,
+        "recovery_timeout_s": 86400.0
+      }
+    },
+    "events": []
+  },
+  "step1_data": {
+    "refreshed": false,
+    "frequencies": {
+      "1h": {
+        "rows": 45107,
+        "symbols": [
+          "US500",
+          "USTEC"
+        ],
+        "first": "2022-10-25 01:00:00+00:00",
+        "last": "2026-09-04 20:00:00+00:00"
+      },
+      "daily": {
+        "rows": 4382,
+        "symbols": [
+          "US500",
+          "USTEC"
+        ],
+        "first": "2019-07-16",
+        "last": "2026-09-04"
+      }
+    }
+  },
+  "decision_date": "2026-02-27",
+  "holdout_window_touched": false,
+  "step2_features": {
+    "rows": 1676,
+    "columns": 74,
+    "sessions": 838,
+    "builder": "case_studies/exness_usidx_sess/_features"
+  },
+  "decision_date_note": "moved back to the last session the panel carries",
+  "decision_bar": {
+    "decision_date": "2026-02-27",
+    "spec": "intraday",
+    "instant": {
+      "session": "2026-02-27",
+      "spec": "intraday",
+      "decision_utc": "2026-02-27T15:00:00+00:00",
+      "decision_server": "2026-02-27T15:00:00",
+      "decision_local": "2026-02-27T10:00:00-05:00",
+      "exec_open_utc": "2026-02-27T15:00:00+00:00",
+      "exec_open_server": "2026-02-27T15:00:00",
+      "cash_open_utc": "2026-02-27T14:30:00+00:00",
+      "cash_close_utc": "2026-02-27T21:00:00+00:00",
+      "half_day": false
+    },
+    "fillable": {
+      "US500": true,
+      "USTEC": true
+    },
+    "missing": [],
+    "has_any_fill": true,
+    "classification": "fillable",
+    "escalates": false
+  },
+  "model": {
+    "selector": "none",
+    "training_hash": null,
+    "population": "exness_usidx_sess:validation-predictions",
+    "refit": false
+  },
+  "step5_predictions": {
+    "rows": 0,
+    "blocked": "no registry for spec 'intraday': set ML4T_OUTPUT_DIR to that spec's workspace, or make experiments/usidx_intraday/exness_usidx_sess/run_log/registry.db reachable. The two specs are two workspaces and no single registry answers for this bot"
+  },
+  "signal_status": "no_deployable_signal",
+  "deployable": false,
+  "stopped_after": "step 5 (no readable registered prediction set)",
+  "finished_at": "2026-09-12T07:28:54.838945+00:00"
+}

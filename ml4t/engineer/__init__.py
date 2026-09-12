@@ -1,0 +1,150 @@
+"""ml4t-engineer - A Financial Machine Learning Feature Engineering Library.
+
+ml4t-engineer is a comprehensive FML stack designed for correctness, reproducibility,
+and performance. It provides tools for feature engineering, labeling, and preprocessing
+for financial machine learning models.
+
+Agent Navigation:
+    This package includes AGENTS.md files for AI agent navigation.
+    Call `get_agent_docs()` to get paths to all documentation files.
+    Start with the root AGENTS.md for package overview and navigation.
+"""
+
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
+from importlib.metadata import version as _dist_version
+from pathlib import Path as _Path
+
+from . import (
+    core,
+    dataset,
+    discovery,
+    features,
+    labeling,
+    preprocessing,
+    relationships,
+    store,
+)
+from .api import compute_features
+from .dataset import (
+    DatasetInfo,
+    FoldResult,
+    MLDatasetBuilder,
+    create_dataset_builder,
+)
+from .discovery import FeatureCatalog
+from .discovery.catalog import features as feature_catalog
+from .preprocessing import (
+    BaseScaler,
+    MinMaxScaler,
+    NotFittedError,
+    PreprocessingPipeline,
+    Preprocessor,
+    RobustScaler,
+    StandardScaler,
+    TransformType,
+)
+
+try:
+    from ._version import version as __version__
+except Exception:
+    try:
+        __version__ = _dist_version("ml4t-engineer")
+    except _PackageNotFoundError:
+        __version__ = "0+unknown"
+
+
+def get_agent_docs() -> dict[str, _Path]:
+    """Get paths to AGENTS.md documentation files for AI agent navigation.
+
+    Returns a dict mapping logical names to file paths. Start with 'root'
+    for package overview, then drill into specific areas as needed.
+
+    Returns
+    -------
+    dict[str, Path]
+        Mapping of doc names to paths. Keys include:
+        - 'root': Package overview and directory map
+        - 'features': Feature category index (120 indicators)
+        - 'features/{category}': Category-specific signatures
+        - 'labeling': ML label generation methods
+        - 'bars': Alternative bar sampling
+        - 'core', 'core/calendars': Registry and validation internals
+        - 'config': Reusable configuration models
+        - 'discovery': Metadata-driven feature search
+        - 'artifacts', 'relationships', 'store', 'logging', 'utils': Secondary
+          package areas with their own navigation guides
+
+    Example
+    -------
+    >>> from ml4t.engineer import get_agent_docs
+    >>> docs = get_agent_docs()
+    >>> print(docs['root'].read_text()[:200])  # Read overview
+    """
+    pkg_dir = _Path(__file__).parent
+    docs: dict[str, _Path] = {}
+
+    # Root and package-level
+    if (p := pkg_dir / "AGENTS.md").exists():
+        docs["root"] = p
+
+    # Features index and categories
+    features_dir = pkg_dir / "features"
+    if (p := features_dir / "AGENTS.md").exists():
+        docs["features"] = p
+    for category_dir in features_dir.iterdir():
+        if category_dir.is_dir() and (p := category_dir / "AGENTS.md").exists():
+            docs[f"features/{category_dir.name}"] = p
+
+    # Other modules
+    for module in [
+        "labeling",
+        "bars",
+        "core",
+        "config",
+        "discovery",
+        "artifacts",
+        "relationships",
+        "store",
+        "logging",
+        "utils",
+    ]:
+        if (p := pkg_dir / module / "AGENTS.md").exists():
+            docs[module] = p
+    if (p := pkg_dir / "core" / "calendars" / "AGENTS.md").exists():
+        docs["core/calendars"] = p
+
+    return docs
+
+
+__all__ = [
+    # Main API
+    "compute_features",
+    # Agent navigation
+    "get_agent_docs",
+    # Feature Discovery (discoverability API)
+    "FeatureCatalog",
+    "feature_catalog",
+    # Dataset builder (leakage-safe train/test preparation)
+    "MLDatasetBuilder",
+    "create_dataset_builder",
+    "FoldResult",
+    "DatasetInfo",
+    # Preprocessing (leakage-safe scalers)
+    "Preprocessor",
+    "PreprocessingPipeline",
+    "TransformType",
+    "StandardScaler",
+    "MinMaxScaler",
+    "RobustScaler",
+    "BaseScaler",
+    "NotFittedError",
+    # Submodules
+    "core",
+    "dataset",
+    "discovery",
+    "features",
+    "labeling",
+    "preprocessing",
+    "relationships",
+    "store",
+]

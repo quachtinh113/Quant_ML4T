@@ -1,0 +1,32 @@
+# exness_btc_8h — deployment risk configuration
+bot_id: exness_btc_8h
+case_study: exness_btc_8h
+
+magic: 260904
+shadow_mode: true
+
+execution:
+  mode: paper
+  armed: false
+  deviation_points: {BTCUSD: 30}
+  close_deviation_points: {BTCUSD: 50}
+  max_margin_fraction: 0.20
+  timeout_seconds: 15.0
+
+capital:
+  min_viable_allocated: 10000.0
+  volume_min: 0.01
+  contract_size: 1.0
+
+limits:
+  max_positions: 1
+  max_order_shares: 0.10
+  max_position_shares: 0.10
+  max_drawdown_pct: 0.08
+  max_daily_loss: 200.0
+
+breakers:
+  drawdown_limit_pct: 0.08
+  consecutive_losses: 5
+  max_realised_cost_bps: 5.0
+  missing_bar_tolerance_minutes: 60

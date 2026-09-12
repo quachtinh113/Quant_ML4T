@@ -1,0 +1,229 @@
+"""Compatibility loaders for case-study artifact sidecars."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from copy import deepcopy
+from functools import cache
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from utils.paths import get_case_study_dir
+
+try:
+    from ml4t.backtest.spec_io import load_spec as _load_shared_spec
+except ImportError:  # pragma: no cover - depends on install state
+    _load_shared_spec = None
+
+
+def _artifact_root(case_study_id: str) -> Path:
+    return get_case_study_dir(case_study_id, create=False) / "config" / "artifacts"
+
+
+def _to_mapping(spec: Any) -> dict[str, Any]:
+    if isinstance(spec, Mapping):
+        return dict(spec)
+    if hasattr(spec, "to_dict"):
+        return dict(spec.to_dict())
+    raise TypeError(f"Unsupported artifact spec type: {type(spec).__name__}")
+
+
+def _load_spec(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    if _load_shared_spec is not None:
+        return _to_mapping(_load_shared_spec(path))
+    with path.open() as f:
+        data = yaml.safe_load(f)
+    return dict(data) if data else None
+
+
+@cache
+def _load_setup_config_cached(case_study_id: str) -> dict[str, Any]:
+    path = get_case_study_dir(case_study_id, create=False) / "config" / "setup.yaml"
+    if not path.exists():
+        return {}
+    with path.open() as f:
+        data = yaml.safe_load(f)
+    return dict(data) if data else {}
+
+
+def load_setup_config(case_study_id: str) -> dict[str, Any]:
+    """Return the whole parsed `config/setup.yaml` for a case study.
+
+    `load_evaluation_config` returns only the `evaluation` section. Callers that
+    also need `labels` (the buffer, the primary label, the variant buffers) read
+    the file through here rather than re-parsing the YAML themselves.
+    """
+    return deepcopy(_load_setup_config_cached(case_study_id))
+
+
+@cache
+def _load_market_data_spec_cached(case_study_id: str) -> dict[str, Any] | None:
+    return _load_spec(_artifact_root(case_study_id) / "market_data.yaml")
+
+
+@cache
+def _load_label_spec_cached(case_study_id: str, label: str) -> dict[str, Any] | None:
+    return _load_spec(_artifact_root(case_study_id) / "labels" / f"{label}.yaml")
+
+
+@cache
+def _load_feature_spec_cached(case_study_id: str, feature_set: str) -> dict[str, Any] | None:
+    return _load_spec(_artifact_root(case_study_id) / "features" / f"{feature_set}.yaml")
+
+
+def load_market_data_spec(case_study_id: str) -> dict[str, Any] | None:
+    spec = _load_market_data_spec_cached(case_study_id)
+    return deepcopy(spec) if spec is not None else None
+
+
+def load_label_spec(case_study_id: str, label: str) -> dict[str, Any] | None:
+    spec = _load_label_spec_cached(case_study_id, label)
+    return deepcopy(spec) if spec is not None else None
+
+
+def load_feature_spec(case_study_id: str, feature_set: str) -> dict[str, Any] | None:
+    spec = _load_feature_spec_cached(case_study_id, feature_set)
+    return deepcopy(spec) if spec is not None else None
+
+
+def resolve_storage_path(
+    case_study_id: str,
+    spec: dict[str, Any] | None,
+    default_relative_path: str,
+) -> Path:
+    if spec is None:
+        return get_case_study_dir(case_study_id, create=False) / default_relative_path
+    storage = spec.get("storage", {})
+    rel_path = storage.get("path", default_relative_path)
+    return get_case_study_dir(case_study_id, create=False) / str(rel_path)
+
+
+def resolve_label_buffer(
+    case_study_id: str,
+    label: str,
+    setup: Mapping[str, Any] | None = None,
+) -> str | None:
+    label_spec = load_label_spec(case_study_id, label)
+    if label_spec is not None:
+        definition = label_spec.get("definition", {})
+        if definition.get("buffer"):
+            return str(definition["buffer"])
+
+    labels = (setup or {}).get("labels", {})
+    if labels.get("primary") == label and labels.get("buffer"):
+        return str(labels["buffer"])
+    variant_buffers = labels.get("variant_buffers", {})
+    if label in variant_buffers:
+        return str(variant_buffers[label])
+    return None
+
+
+LABEL_BUFFER_UNITS = ("sessions", "calendar")
+DEFAULT_LABEL_BUFFER_UNIT = "sessions"
+
+
+def resolve_label_buffer_unit(
+    case_study_id: str,
+    label: str,
+    setup: Mapping[str, Any] | None = None,
+) -> str:
+    """Say whether a label's buffer counts sessions or calendar time.
+
+    A buffer is written as a duration - ``21D``, ``35D``, ``8H`` - and the duration alone
+    does not say which of the two it means. Both readings are live. On a session-gridded
+    daily panel ``21D`` means 21 sessions, and subtracting 21 calendar days from the
+    holdout boundary leaks about six sessions into it. ``sp500_options`` declares
+    ``35D`` for ``ret_to_expiry``, which is a genuine calendar horizon to option expiry,
+    and reading it as 35 sessions trims about seven weeks where five is correct - data
+    loss rather than leakage, but still a frame that ends earlier than it needs to.
+
+    Without a declaration each consumer guesses, and the guess is made independently in
+    every consumer and is wrong for one class of label wherever it is made. This is the
+    declaration; ``sessions`` is the default because it is the reading every ``D`` buffer
+    already gets wherever a calendar is configured.
+
+    Declared the same way and in the same order as the buffer itself
+    (:func:`resolve_label_buffer`): on the label spec under ``definition.buffer_unit``, or
+    in ``setup.yaml`` under ``labels.buffer_unit`` for the primary and
+    ``labels.variant_buffer_units[<label>]`` for a variant.
+    """
+    label_spec = load_label_spec(case_study_id, label)
+    declared: Any = None
+    if label_spec is not None:
+        declared = (label_spec.get("definition", {}) or {}).get("buffer_unit")
+
+    if declared is None:
+        labels = (setup or {}).get("labels", {})
+        if labels.get("primary") == label:
+            declared = labels.get("buffer_unit")
+        if declared is None:
+            declared = (labels.get("variant_buffer_units") or {}).get(label)
+
+    if declared is None:
+        return DEFAULT_LABEL_BUFFER_UNIT
+    unit = str(declared)
+    if unit not in LABEL_BUFFER_UNITS:
+        raise ValueError(
+            f"{case_study_id}/{label}: buffer_unit is {unit!r}, "
+            f"not one of {list(LABEL_BUFFER_UNITS)}"
+        )
+    return unit
+
+
+def resolve_label_horizon(
+    case_study_id: str,
+    label: str,
+    setup: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Return the outcome horizon, which may be shorter than the CV buffer."""
+    label_spec = load_label_spec(case_study_id, label)
+    if label_spec is not None:
+        definition = label_spec.get("definition", {})
+        if definition.get("horizon"):
+            return str(definition["horizon"])
+
+    labels = (setup or {}).get("labels", {})
+    horizon = (labels.get("horizons") or {}).get(label)
+    return str(horizon) if horizon else resolve_label_buffer(case_study_id, label, setup)
+
+
+def resolve_market_semantics(
+    case_study_id: str,
+    setup: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    market_spec = load_market_data_spec(case_study_id) or {}
+    semantics = market_spec.get("semantics", {})
+    evaluation = (setup or {}).get("evaluation", {})
+    return {
+        "calendar": semantics.get("calendar") or evaluation.get("calendar"),
+        "timezone": semantics.get("timezone"),
+        "data_frequency": semantics.get("data_frequency"),
+        "timestamp_semantics": semantics.get("timestamp_semantics"),
+        "session_start_time": semantics.get("session_start_time"),
+        "bar_type": semantics.get("bar_type"),
+    }
+
+
+def resolve_market_runtime(case_study_id: str) -> dict[str, Any]:
+    market_spec = load_market_data_spec(case_study_id) or {}
+    runtime = market_spec.get("runtime", {})
+    return dict(runtime) if isinstance(runtime, Mapping) else {}
+
+
+__all__ = [
+    "DEFAULT_LABEL_BUFFER_UNIT",
+    "LABEL_BUFFER_UNITS",
+    "load_feature_spec",
+    "load_label_spec",
+    "load_market_data_spec",
+    "resolve_label_buffer",
+    "resolve_label_buffer_unit",
+    "resolve_label_horizon",
+    "resolve_market_runtime",
+    "resolve_market_semantics",
+    "resolve_storage_path",
+]

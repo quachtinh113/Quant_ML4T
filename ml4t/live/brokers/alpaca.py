@@ -1,0 +1,969 @@
+"""Alpaca Markets broker implementation using alpaca-py.
+
+This module provides async broker integration with Alpaca Markets API.
+Supports both stocks and crypto trading.
+
+Design (matching IBBroker patterns):
+- All broker operations are async
+- Uses asyncio.Lock for thread safety
+- WebSocket stream for real-time order updates
+- REST API for account/position queries and order submission
+"""
+
+import asyncio
+import logging
+import math
+import time
+from datetime import UTC, datetime
+from typing import Any
+
+from alpaca.common.enums import BaseURL
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import OrderSide as AlpacaOrderSide
+from alpaca.trading.enums import OrderStatus as AlpacaOrderStatus
+from alpaca.trading.enums import QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import (
+    GetOrdersRequest,
+    LimitOrderRequest,
+    MarketOrderRequest,
+    StopLimitOrderRequest,
+    StopOrderRequest,
+)
+from alpaca.trading.stream import TradingStream
+from ml4t.backtest.types import Order, OrderSide, OrderStatus, OrderType, Position
+from ml4t.specs import ExecutionCapability
+
+from ml4t.live.orders import CanonicalOrderRequest
+from ml4t.live.persistence import redact_sensitive
+
+logger = logging.getLogger(__name__)
+
+
+class AlpacaBroker:
+    """Alpaca Markets broker implementation.
+
+    Design (matching IBBroker patterns):
+    - All broker operations are async
+    - Uses asyncio.Lock for thread safety
+    - WebSocket stream for real-time order updates
+    - REST API for account/position queries and order submission
+
+    Paper vs Live:
+    - paper=True (default): Uses paper trading endpoint
+    - paper=False: Uses live trading endpoint (USE WITH CAUTION)
+
+    Example:
+        broker = AlpacaBroker(
+            api_key='PKXXXXXXXX',
+            secret_key='XXXXXXXXXX',
+            paper=True,  # Always start with paper trading!
+        )
+        await broker.connect()
+        positions = await broker.get_positions_async()
+        await broker.disconnect()
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        secret_key: str,
+        paper: bool = True,  # Paper trading by default (SAFETY)
+    ) -> None:
+        """Initialize AlpacaBroker.
+
+        Args:
+            api_key: Alpaca API key (from https://app.alpaca.markets)
+            secret_key: Alpaca secret key
+            paper: Use paper trading endpoint (default: True)
+        """
+        self._api_key = api_key
+        self._secret_key = secret_key
+        self._paper = paper
+
+        # Clients (created in connect())
+        self._trading_client: TradingClient | None = None
+        self._trading_stream: TradingStream | None = None
+        self._stream_task: asyncio.Task | None = None
+
+        # Connection state
+        self._connected = False
+
+        # Thread-safe state with locks (matching IBBroker pattern)
+        self._positions: dict[str, Position] = {}
+        self._position_lock = asyncio.Lock()
+        self._pending_orders: dict[str, Order] = {}
+        self._order_lock = asyncio.Lock()
+
+        # Order tracking (matching IBBroker pattern)
+        self._order_counter = 0
+        # Alpaca order ID (UUID string) -> (our_id, timestamp)
+        self._alpaca_order_map: dict[str, tuple[str, float]] = {}
+        self._account_id: str | None = None
+        self._snapshot_error: RuntimeError | None = None
+
+    @property
+    def execution_capabilities(self) -> frozenset[ExecutionCapability]:
+        """Return order behaviors implemented by this adapter."""
+        return frozenset(
+            {
+                ExecutionCapability.LIMIT,
+                ExecutionCapability.STOP,
+                ExecutionCapability.STOP_LIMIT,
+                ExecutionCapability.CLOSE_AUCTION,
+                ExecutionCapability.PARTIAL_FILL,
+            }
+        )
+
+    async def connect(self) -> None:
+        """Connect to Alpaca and sync initial state.
+
+        Steps:
+        1. Create TradingClient (REST)
+        2. Create TradingStream (WebSocket)
+        3. Verify connection by fetching account
+        4. Register trade update callback
+        5. Sync positions and open orders
+        6. Start WebSocket stream for order updates
+
+        Raises:
+            RuntimeError: If connection fails
+        """
+        if self._connected:
+            logger.info("AlpacaBroker: Already connected")
+            return
+
+        mode = "paper" if self._paper else "LIVE"
+        logger.info(f"AlpacaBroker: Connecting ({mode} trading)")
+        self._snapshot_error = None
+
+        try:
+            # Create REST client
+            self._trading_client = TradingClient(
+                api_key=self._api_key,
+                secret_key=self._secret_key,
+                paper=self._paper,
+            )
+
+            # Verify connection by fetching account
+            account = self._trading_client.get_account()
+            account_id = getattr(account, "account_number", None)
+            if not isinstance(account_id, str) or not account_id.strip():
+                raise RuntimeError("Alpaca returned no account identity")
+            self._account_id = account_id.strip()
+            equity = self._validate_account_metric(account, "equity")
+            cash = self._validate_account_metric(account, "cash", allow_negative=True)
+            logger.info(
+                f"AlpacaBroker: Account verified - equity=${equity:,.2f}, cash=${cash:,.2f}"
+            )
+
+            # Create WebSocket stream for order updates
+            self._trading_stream = TradingStream(
+                api_key=self._api_key,
+                secret_key=self._secret_key,
+                paper=self._paper,
+            )
+
+            # Subscribe to trade updates BEFORE initial sync (IBBroker pattern)
+            self._trading_stream.subscribe_trade_updates(self._on_trade_update)
+
+            # Initial sync
+            await self._sync_positions()
+            await self._sync_orders()
+
+            # Start stream in background task
+            self._stream_task = asyncio.create_task(self._run_trading_stream())
+
+            self._connected = True
+            logger.info("AlpacaBroker: Connected successfully")
+
+        except Exception as e:
+            detail = str(redact_sensitive(str(e)))
+            logger.error("AlpacaBroker: Connection failed: %s", detail)
+            if self._stream_task is not None:
+                self._stream_task.cancel()
+            if self._stream_task is not None and self._trading_stream is not None:
+                try:
+                    self._trading_stream.stop()
+                except Exception as stop_error:
+                    logger.error(
+                        "AlpacaBroker: Failed to stop stream after connect failure: %s",
+                        redact_sensitive(str(stop_error)),
+                    )
+            self._connected = False
+            self._snapshot_error = RuntimeError("Alpaca initial broker snapshot is unavailable")
+            self._account_id = None
+            self._trading_client = None
+            self._trading_stream = None
+            self._stream_task = None
+            raise RuntimeError(f"Failed to connect to Alpaca: {detail}") from None
+
+    async def disconnect(self) -> None:
+        """Disconnect from Alpaca."""
+        if not self._connected:
+            return
+
+        stream_task = self._stream_task
+        if self._trading_stream:
+            try:
+                deadline = time.monotonic() + 2.0
+                stream_loop = getattr(self._trading_stream, "_loop", None)
+                while (
+                    stream_task is not None
+                    and not stream_task.done()
+                    and stream_loop is None
+                    and time.monotonic() < deadline
+                ):
+                    await asyncio.sleep(0.01)
+                    stream_loop = getattr(self._trading_stream, "_loop", None)
+                self._trading_stream.stop()
+            except Exception as e:
+                logger.warning("AlpacaBroker: Error stopping stream: %s", redact_sensitive(str(e)))
+        if stream_task and not stream_task.done():
+            try:
+                await asyncio.wait_for(stream_task, timeout=5.0)
+            except TimeoutError:
+                stream_task.cancel()
+                try:
+                    await stream_task
+                except asyncio.CancelledError:
+                    pass
+
+        self._connected = False
+        self._account_id = None
+        self._trading_client = None
+        self._trading_stream = None
+        self._stream_task = None
+
+        logger.info("AlpacaBroker: Disconnected")
+
+    @property
+    def is_connected(self) -> bool:
+        """Check if connected to Alpaca."""
+        return self._connected and self._trading_client is not None
+
+    async def is_connected_async(self) -> bool:
+        """Return current REST and adapter connection state."""
+        return bool(self.is_connected)
+
+    def assert_paper_trading(self) -> None:
+        """Fail unless the connected client is authenticated through Alpaca's paper endpoint."""
+        if not self.is_connected or self._trading_client is None or self._account_id is None:
+            raise RuntimeError("Alpaca paper identity requires a connected account")
+        if self._paper is not True:
+            raise RuntimeError("Alpaca broker is configured for live trading")
+        if getattr(self._trading_client, "_sandbox", None) is not True:
+            raise RuntimeError("Alpaca client did not confirm sandbox mode")
+        if getattr(self._trading_client, "_base_url", None) != BaseURL.TRADING_PAPER:
+            raise RuntimeError("Alpaca client is not using the official paper endpoint")
+
+    def assert_live_trading(self) -> None:
+        """Fail unless the connected client is authenticated through Alpaca's live endpoint."""
+        if not self.is_connected or self._trading_client is None or self._account_id is None:
+            raise RuntimeError("Alpaca live identity requires a connected account")
+        if self._paper is not False:
+            raise RuntimeError("Alpaca broker is configured for paper trading")
+        if getattr(self._trading_client, "_sandbox", None) is not False:
+            raise RuntimeError("Alpaca client did not confirm live mode")
+        if getattr(self._trading_client, "_base_url", None) != BaseURL.TRADING_LIVE:
+            raise RuntimeError("Alpaca client is not using the official live endpoint")
+
+    # === AsyncBrokerProtocol Implementation ===
+
+    @property
+    def positions(self) -> dict[str, Position]:
+        """Thread-safe position access (shallow copy).
+
+        Note: This is called from worker thread via ThreadSafeBrokerWrapper.
+        The shallow copy prevents RuntimeError during dict iteration.
+
+        Returns:
+            Dictionary mapping asset symbols to Position objects
+        """
+        return dict(self._positions)  # Shallow copy is atomic for small dicts
+
+    @property
+    def pending_orders(self) -> list[Order]:
+        """Get list of pending orders.
+
+        Returns:
+            List of pending Order objects
+        """
+        return list(self._pending_orders.values())
+
+    def get_position(self, asset: str) -> Position | None:
+        """Thread-safe single position access.
+
+        Args:
+            asset: Asset symbol (e.g., 'AAPL' or 'BTC/USD')
+
+        Returns:
+            Position object if exists, None otherwise
+        """
+        return self._positions.get(asset.upper())
+
+    async def get_positions_async(self) -> dict[str, Position]:
+        """Async thread-safe position access with lock.
+
+        Returns:
+            Dictionary mapping asset symbols to Position objects
+        """
+        self._raise_snapshot_error()
+        async with self._position_lock:
+            return dict(self._positions)
+
+    async def get_position_async(self, asset: str) -> Position | None:
+        """Return one position from the synchronized adapter snapshot."""
+        self._raise_snapshot_error()
+        async with self._position_lock:
+            return self._positions.get(asset.upper())
+
+    async def get_pending_orders_async(self, asset: str | None = None) -> list[Order]:
+        """Return pending orders, optionally filtered by asset."""
+        self._raise_snapshot_error()
+        orders = list(self._pending_orders.values())
+        if asset is None:
+            return orders
+        normalized = asset.upper()
+        return [order for order in orders if order.asset.upper() == normalized]
+
+    async def get_account_value_async(self) -> float:
+        """Get portfolio value (equity).
+
+        Returns:
+            Total account equity in USD
+        """
+        if not self._trading_client:
+            raise RuntimeError("Alpaca trading client is unavailable")
+
+        account = self._trading_client.get_account()
+        return self._validate_account_metric(account, "equity")
+
+    async def get_cash_async(self) -> float:
+        """Get the signed cash balance.
+
+        Returns:
+            Cash balance in USD. Margin accounts may report a negative balance.
+        """
+        if not self._trading_client:
+            raise RuntimeError("Alpaca trading client is unavailable")
+
+        account = self._trading_client.get_account()
+        return self._validate_account_metric(account, "cash", allow_negative=True)
+
+    def _raise_snapshot_error(self) -> None:
+        if self._snapshot_error is not None:
+            raise RuntimeError(str(self._snapshot_error)) from self._snapshot_error
+
+    def _validate_account_metric(
+        self, account: Any, name: str, *, allow_negative: bool = False
+    ) -> float:
+        account_id = getattr(account, "account_number", None)
+        if not isinstance(account_id, str) or not account_id.strip():
+            raise RuntimeError("Alpaca account identity is unavailable")
+        if self._account_id is not None and account_id != self._account_id:
+            raise RuntimeError("Alpaca account identity changed during the connection")
+        try:
+            metric = float(getattr(account, name))
+        except (AttributeError, TypeError, ValueError) as error:
+            raise RuntimeError(f"Alpaca {name} is not numeric") from error
+        if not math.isfinite(metric):
+            raise RuntimeError(f"Alpaca {name} must be finite")
+        if metric < 0 and not allow_negative:
+            raise RuntimeError(f"Alpaca {name} must be finite and non-negative")
+        return metric
+
+    async def submit_order_async(
+        self,
+        asset: str,
+        quantity: float,
+        side: OrderSide | None = None,
+        order_type: OrderType = OrderType.MARKET,
+        limit_price: float | None = None,
+        stop_price: float | None = None,
+        **kwargs: Any,
+    ) -> Order:
+        """Submit order to Alpaca.
+
+        Args:
+            asset: Asset symbol (e.g., 'AAPL' or 'BTC/USD')
+            quantity: Signed shares/units when side is omitted; positive unsigned
+                shares/units when side is provided
+            side: BUY or SELL, inferred from signed quantity if omitted
+            order_type: Market, limit, stop, or stop-limit
+            limit_price: Limit price for limit orders
+            stop_price: Stop price for stop orders
+            **kwargs: Additional parameters (ignored)
+
+        Returns:
+            Order object
+
+        Raises:
+            RuntimeError: If not connected
+            ValueError: If order parameters are invalid
+        """
+        if not self.is_connected or not self._trading_client:
+            raise RuntimeError("Not connected to Alpaca")
+
+        request = CanonicalOrderRequest.from_input(
+            asset,
+            quantity,
+            side,
+            order_type,
+            limit_price,
+            stop_price,
+            capabilities=self.execution_capabilities,
+        )
+        asset = request.asset
+        qty = request.quantity
+        side = request.side
+        order_type = request.order_type
+        limit_price = request.limit_price
+        stop_price = request.stop_price
+        client_order_id = kwargs.get("client_order_id")
+        if client_order_id is not None and (
+            not isinstance(client_order_id, str)
+            or not client_order_id
+            or len(client_order_id) > 48
+            or not client_order_id.replace("-", "").replace("_", "").isalnum()
+        ):
+            raise ValueError(
+                "client_order_id must be 1-48 letters, numbers, hyphens, or underscores"
+            )
+        if order_type == OrderType.MOC:
+            if kwargs.get("extended_hours"):
+                raise ValueError("Alpaca MOC orders do not support extended_hours=True")
+            if "/" in asset:
+                raise NotImplementedError("Alpaca MOC orders are only supported for US equities")
+            if not qty.is_integer():
+                raise ValueError("Alpaca MOC orders require whole-share quantities")
+
+        # Create order request
+        order_request = self._create_order_request(
+            asset,
+            qty,
+            side,
+            order_type,
+            limit_price,
+            stop_price,
+            client_order_id=client_order_id,
+        )
+
+        # Submit atomically with lock (IBBroker pattern)
+        async with self._order_lock:
+            self._order_counter += 1
+            order_id = f"ML4T-{self._order_counter}"
+
+            # Submit to Alpaca
+            alpaca_order = self._trading_client.submit_order(order_request)
+
+            # Create our order object
+            order = Order(
+                asset=asset,
+                side=side,
+                quantity=qty,
+                order_type=order_type,
+                limit_price=limit_price,
+                stop_price=stop_price,
+                order_id=order_id,
+                status=self._map_order_status(alpaca_order.status),
+                created_at=alpaca_order.created_at or datetime.now(UTC),
+            )
+
+            if order.status is OrderStatus.FILLED:
+                if alpaca_order.filled_qty is None or alpaca_order.filled_avg_price is None:
+                    raise RuntimeError("Alpaca filled order is missing fill evidence")
+                order.filled_quantity = float(alpaca_order.filled_qty)
+                order.filled_price = float(alpaca_order.filled_avg_price)
+                order.filled_at = getattr(alpaca_order, "filled_at", None) or datetime.now(UTC)
+
+            # Track order
+            if order.status is OrderStatus.PENDING:
+                self._pending_orders[order_id] = order
+                self._alpaca_order_map[str(alpaca_order.id)] = (order_id, time.time())
+
+        logger.info(f"AlpacaBroker: Order {order_id} submitted: {side.value} {qty} {asset}")
+        return order
+
+    async def cancel_order_async(self, order_id: str) -> bool:
+        """Cancel pending order.
+
+        Args:
+            order_id: Order ID to cancel (e.g., 'ML4T-1')
+
+        Returns:
+            True if cancellation request sent successfully, False otherwise
+        """
+        if not self._trading_client:
+            return False
+
+        # Find Alpaca order ID from our tracking map
+        alpaca_order_id = None
+        for alpaca_id, (our_id, _) in self._alpaca_order_map.items():
+            if our_id == order_id:
+                alpaca_order_id = alpaca_id
+                break
+
+        if alpaca_order_id is None:
+            logger.warning(f"AlpacaBroker: Order {order_id} not found in tracking map")
+            return False
+
+        try:
+            self._trading_client.cancel_order_by_id(alpaca_order_id)
+            logger.info(f"AlpacaBroker: Cancellation requested for order {order_id}")
+            return True
+        except Exception as e:
+            logger.warning(
+                "AlpacaBroker: Failed to cancel order %s: %s",
+                order_id,
+                redact_sensitive(str(e)),
+            )
+            return False
+
+    async def replace_order_async(
+        self,
+        order_id: str,
+        *,
+        quantity: float | None = None,
+        limit_price: float | None = None,
+        stop_price: float | None = None,
+        **kwargs: Any,
+    ) -> Order:
+        """Replace a pending order via cancel-and-resubmit."""
+        original = self._pending_orders.get(order_id)
+        if original is None:
+            raise RuntimeError(f"Order {order_id} not found in pending orders")
+
+        replacement_quantity = original.quantity if quantity is None else quantity
+        replacement_limit = original.limit_price if limit_price is None else limit_price
+        replacement_stop = original.stop_price if stop_price is None else stop_price
+
+        cancelled = await self.cancel_order_async(order_id)
+        if not cancelled:
+            raise RuntimeError(f"Failed to cancel order {order_id} before replacement")
+
+        return await self.submit_order_async(
+            asset=original.asset,
+            quantity=replacement_quantity,
+            side=original.side,
+            order_type=original.order_type,
+            limit_price=replacement_limit,
+            stop_price=replacement_stop,
+            **kwargs,
+        )
+
+    async def close_position_async(self, asset: str) -> Order | None:
+        """Close position in asset.
+
+        Args:
+            asset: Asset symbol
+
+        Returns:
+            Order object if position exists, None otherwise
+        """
+        pos = self.get_position(asset)
+        if not pos or pos.quantity == 0:
+            return None
+
+        side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
+        return await self.submit_order_async(asset, abs(pos.quantity), side)
+
+    # === Internal Methods ===
+
+    def _create_order_request(
+        self,
+        asset: str,
+        quantity: float,
+        side: OrderSide,
+        order_type: OrderType,
+        limit_price: float | None,
+        stop_price: float | None,
+        *,
+        client_order_id: str | None = None,
+    ) -> MarketOrderRequest | LimitOrderRequest | StopOrderRequest | StopLimitOrderRequest:
+        """Create Alpaca order request.
+
+        Args:
+            asset: Asset symbol
+            quantity: Number of shares
+            side: BUY or SELL
+            order_type: Market, limit, stop, or stop-limit
+            limit_price: Limit price for limit orders
+            stop_price: Stop price for stop orders
+
+        Returns:
+            Alpaca order request object
+
+        Raises:
+            ValueError: If order type is unsupported
+        """
+        alpaca_side = AlpacaOrderSide.BUY if side == OrderSide.BUY else AlpacaOrderSide.SELL
+
+        # Check if crypto (symbol contains '/')
+        is_crypto = "/" in asset
+
+        # Use appropriate time in force
+        # Crypto supports GTC, stocks use DAY
+        tif = TimeInForce.GTC if is_crypto else TimeInForce.DAY
+
+        if order_type == OrderType.MOC:
+            return MarketOrderRequest(
+                symbol=asset,
+                qty=quantity,
+                side=alpaca_side,
+                time_in_force=TimeInForce.CLS,
+                client_order_id=client_order_id,
+            )
+        elif order_type == OrderType.MARKET:
+            return MarketOrderRequest(
+                symbol=asset,
+                qty=quantity,
+                side=alpaca_side,
+                time_in_force=tif,
+                client_order_id=client_order_id,
+            )
+        elif order_type == OrderType.LIMIT:
+            if limit_price is None:
+                raise ValueError("Limit price required for limit orders")
+            return LimitOrderRequest(
+                symbol=asset,
+                qty=quantity,
+                side=alpaca_side,
+                limit_price=limit_price,
+                time_in_force=tif,
+                client_order_id=client_order_id,
+            )
+        elif order_type == OrderType.STOP:
+            if stop_price is None:
+                raise ValueError("Stop price required for stop orders")
+            return StopOrderRequest(
+                symbol=asset,
+                qty=quantity,
+                side=alpaca_side,
+                stop_price=stop_price,
+                time_in_force=tif,
+                client_order_id=client_order_id,
+            )
+        elif order_type == OrderType.STOP_LIMIT:
+            if limit_price is None or stop_price is None:
+                raise ValueError("Both limit and stop price required for stop-limit orders")
+            return StopLimitOrderRequest(
+                symbol=asset,
+                qty=quantity,
+                side=alpaca_side,
+                limit_price=limit_price,
+                stop_price=stop_price,
+                time_in_force=tif,
+                client_order_id=client_order_id,
+            )
+        else:
+            raise ValueError(f"Unsupported order type: {order_type}")
+
+    def _map_order_status(self, alpaca_status: AlpacaOrderStatus) -> OrderStatus:
+        """Map Alpaca order status to ML4T order status.
+
+        Args:
+            alpaca_status: Alpaca order status enum
+
+        Returns:
+            ML4T OrderStatus enum
+        """
+        status_map = {
+            AlpacaOrderStatus.NEW: OrderStatus.PENDING,
+            AlpacaOrderStatus.ACCEPTED: OrderStatus.PENDING,
+            AlpacaOrderStatus.PENDING_NEW: OrderStatus.PENDING,
+            AlpacaOrderStatus.PARTIALLY_FILLED: OrderStatus.PENDING,
+            AlpacaOrderStatus.FILLED: OrderStatus.FILLED,
+            AlpacaOrderStatus.CANCELED: OrderStatus.CANCELLED,
+            AlpacaOrderStatus.EXPIRED: OrderStatus.CANCELLED,
+            AlpacaOrderStatus.REJECTED: OrderStatus.REJECTED,
+            AlpacaOrderStatus.PENDING_CANCEL: OrderStatus.PENDING,
+            AlpacaOrderStatus.PENDING_REPLACE: OrderStatus.PENDING,
+            AlpacaOrderStatus.REPLACED: OrderStatus.CANCELLED,
+            AlpacaOrderStatus.STOPPED: OrderStatus.PENDING,
+            AlpacaOrderStatus.SUSPENDED: OrderStatus.PENDING,
+        }
+        try:
+            return status_map[alpaca_status]
+        except KeyError as error:
+            raise RuntimeError(f"Unsupported Alpaca order status {alpaca_status!r}") from error
+
+    async def _on_trade_update(self, data: Any) -> None:
+        """Handle WebSocket trade update.
+
+        This callback is invoked when order status changes via WebSocket.
+        It updates our internal order tracking and handles filled/cancelled orders.
+
+        Args:
+            data: Trade update data from Alpaca WebSocket
+        """
+        try:
+            event = data.event
+            order_data = data.order
+            alpaca_order_id = str(order_data.id)
+
+            entry = self._alpaca_order_map.get(alpaca_order_id)
+            if not entry:
+                # Order not tracked by us
+                return
+
+            order_id, _ = entry
+            order = self._pending_orders.get(order_id)
+            if not order:
+                # Order already processed
+                return
+
+            logger.debug(f"AlpacaBroker: Trade update - {event} for order {order_id}")
+
+            try:
+                filled_quantity = float(order_data.filled_qty or 0.0)
+                filled_price = float(order_data.filled_avg_price or 0.0)
+            except (TypeError, ValueError) as error:
+                raise RuntimeError("Alpaca order update contains non-numeric fill data") from error
+            if (
+                not math.isfinite(filled_quantity)
+                or filled_quantity < 0
+                or filled_quantity > order.quantity
+            ):
+                raise RuntimeError("Alpaca order update contains an invalid cumulative fill")
+            if filled_quantity < order.filled_quantity:
+                logger.warning(
+                    "AlpacaBroker: Ignoring out-of-order fill update for %s: %s < %s",
+                    order_id,
+                    filled_quantity,
+                    order.filled_quantity,
+                )
+                return
+
+            if event == "fill":
+                if filled_quantity == 0:
+                    filled_quantity = order.quantity
+                if (
+                    filled_quantity != order.quantity
+                    or not math.isfinite(filled_price)
+                    or filled_price <= 0
+                ):
+                    raise RuntimeError("Alpaca filled update is incomplete or invalid")
+                # Order filled - update status and remove from pending
+                order.status = OrderStatus.FILLED
+                order.filled_price = filled_price
+                order.filled_quantity = filled_quantity
+                order.filled_at = datetime.now(UTC)
+
+                async with self._order_lock:
+                    if order_id in self._pending_orders:
+                        del self._pending_orders[order_id]
+
+                logger.info(f"AlpacaBroker: Order {order_id} FILLED @ {order.filled_price}")
+
+                # Memory leak fix: schedule cleanup after 1 hour (IBBroker pattern)
+                def cleanup_order(oid: str = alpaca_order_id) -> None:
+                    self._alpaca_order_map.pop(oid, None)
+
+                loop = asyncio.get_event_loop()
+                loop.call_later(3600, cleanup_order)
+
+                # Sync positions after fill
+                await self._sync_positions()
+
+            elif event == "partial_fill":
+                # Partial fill - update fill info but keep pending
+                if filled_quantity >= order.quantity:
+                    raise RuntimeError("Alpaca partial fill cannot equal the order quantity")
+                order.filled_quantity = filled_quantity
+                if filled_price > 0 and math.isfinite(filled_price):
+                    order.filled_price = filled_price
+                logger.info(f"AlpacaBroker: Order {order_id} partial fill: {order.filled_quantity}")
+
+            elif event in ("canceled", "expired", "rejected"):
+                # Terminal state - update status and cleanup immediately
+                if event == "rejected":
+                    order.status = OrderStatus.REJECTED
+                else:
+                    order.status = OrderStatus.CANCELLED
+
+                async with self._order_lock:
+                    if order_id in self._pending_orders:
+                        del self._pending_orders[order_id]
+
+                # Memory leak fix: cleanup immediately (IBBroker pattern)
+                self._alpaca_order_map.pop(alpaca_order_id, None)
+                logger.info(f"AlpacaBroker: Order {order_id} {event.upper()}")
+
+            elif event == "replaced":
+                order.status = OrderStatus.CANCELLED
+                async with self._order_lock:
+                    self._pending_orders.pop(order_id, None)
+                self._alpaca_order_map.pop(alpaca_order_id, None)
+
+            elif event in (
+                "new",
+                "accepted",
+                "pending_new",
+                "pending_cancel",
+                "pending_replace",
+                "stopped",
+                "suspended",
+                "calculated",
+                "order_cancel_rejected",
+                "order_replace_rejected",
+            ):
+                return
+
+            elif event == "done_for_day":
+                order.status = OrderStatus.CANCELLED
+                async with self._order_lock:
+                    self._pending_orders.pop(order_id, None)
+                self._alpaca_order_map.pop(alpaca_order_id, None)
+
+            else:
+                raise RuntimeError(f"unsupported Alpaca order event {event!r}")
+
+        except Exception as e:
+            detail = str(redact_sensitive(str(e)))
+            self._snapshot_error = RuntimeError(f"Alpaca order state is unavailable: {detail}")
+            self._connected = False
+            logger.error("AlpacaBroker: Error processing trade update: %s", detail)
+
+    async def _run_trading_stream(self) -> None:
+        """Run TradingStream in background thread.
+
+        Note: TradingStream.run() calls asyncio.run() internally, so we must
+        run it in a separate thread to avoid "cannot be called from a running
+        event loop" errors.
+        """
+        try:
+            logger.info("AlpacaBroker: Starting trading stream")
+            if self._trading_stream:
+                # Run in thread pool since .run() creates its own event loop
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._trading_stream.run)
+        except asyncio.CancelledError:
+            logger.info("AlpacaBroker: Trading stream cancelled")
+            if self._trading_stream:
+                self._trading_stream.stop()
+        except Exception as e:
+            logger.error("AlpacaBroker: Trading stream error: %s", redact_sensitive(str(e)))
+            self._connected = False
+
+    async def _sync_positions(self) -> None:
+        """Sync positions from Alpaca via REST API."""
+        if not self._trading_client:
+            raise RuntimeError("Alpaca trading client is unavailable during position sync")
+
+        alpaca_positions = self._trading_client.get_all_positions()
+        if not isinstance(alpaca_positions, list):
+            raise RuntimeError("Alpaca positions snapshot must be a list")
+
+        candidate_positions: dict[str, Position] = {}
+        for pos in alpaca_positions:
+            try:
+                symbol = str(pos.symbol).strip().upper()
+                quantity = float(pos.qty)
+                entry_price = float(pos.avg_entry_price)
+                current_price = float(pos.current_price) if pos.current_price else entry_price
+            except (AttributeError, TypeError, ValueError) as error:
+                raise RuntimeError("Alpaca positions snapshot contains invalid values") from error
+            if not symbol:
+                raise RuntimeError("Alpaca positions snapshot contains an empty symbol")
+            if not math.isfinite(quantity) or quantity == 0:
+                raise RuntimeError("Alpaca positions snapshot contains an invalid quantity")
+            if not math.isfinite(entry_price) or entry_price < 0:
+                raise RuntimeError("Alpaca positions snapshot contains an invalid entry price")
+            if not math.isfinite(current_price) or current_price < 0:
+                raise RuntimeError("Alpaca positions snapshot contains an invalid current price")
+            if symbol in candidate_positions:
+                raise RuntimeError("Alpaca positions snapshot contains a duplicate symbol")
+            candidate_positions[symbol] = Position(
+                asset=symbol,
+                quantity=quantity,
+                entry_price=entry_price,
+                entry_time=datetime.now(UTC),
+                current_price=current_price,
+            )
+
+        async with self._position_lock:
+            self._positions = candidate_positions
+
+        logger.info("AlpacaBroker: Synced %s positions", len(self._positions))
+
+    async def _sync_orders(self) -> None:
+        """Sync open orders from Alpaca."""
+        if not self._trading_client:
+            raise RuntimeError("Alpaca trading client is unavailable during order sync")
+
+        request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+        alpaca_orders = self._trading_client.get_orders(request)
+        if not isinstance(alpaca_orders, list):
+            raise RuntimeError("Alpaca open-orders snapshot must be a list")
+
+        candidate_orders: dict[str, Order] = {}
+        candidate_map: dict[str, tuple[str, float]] = {}
+        next_order_counter = self._order_counter
+        for alpaca_order in alpaca_orders:
+            next_order_counter += 1
+            order_id = f"ML4T-{next_order_counter}"
+
+            order_type = OrderType.MARKET
+            time_in_force = str(
+                getattr(getattr(alpaca_order, "time_in_force", None), "value", "")
+            ).lower()
+            if time_in_force == "cls":
+                order_type = OrderType.MOC
+            elif alpaca_order.limit_price:
+                if alpaca_order.stop_price:
+                    order_type = OrderType.STOP_LIMIT
+                else:
+                    order_type = OrderType.LIMIT
+            elif alpaca_order.stop_price:
+                order_type = OrderType.STOP
+
+            try:
+                asset = str(alpaca_order.symbol).strip().upper()
+                if alpaca_order.qty is None:
+                    raise ValueError("missing quantity")
+                quantity = float(alpaca_order.qty)
+                limit_price = float(alpaca_order.limit_price) if alpaca_order.limit_price else None
+                stop_price = float(alpaca_order.stop_price) if alpaca_order.stop_price else None
+                venue_id = str(alpaca_order.id).strip()
+                created_at = alpaca_order.created_at or datetime.now(UTC)
+            except (AttributeError, TypeError, ValueError) as error:
+                raise RuntimeError("Alpaca open-orders snapshot contains invalid values") from error
+            if (
+                not asset
+                or not venue_id
+                or not math.isfinite(quantity)
+                or quantity <= 0
+                or (
+                    limit_price is not None and (not math.isfinite(limit_price) or limit_price <= 0)
+                )
+                or (stop_price is not None and (not math.isfinite(stop_price) or stop_price <= 0))
+                or not isinstance(created_at, datetime)
+                or created_at.utcoffset() is None
+                or self._map_order_status(alpaca_order.status) is not OrderStatus.PENDING
+                or venue_id in candidate_map
+            ):
+                raise RuntimeError("Alpaca open-orders snapshot contains an invalid order")
+            if alpaca_order.side not in (AlpacaOrderSide.BUY, AlpacaOrderSide.SELL):
+                raise RuntimeError("Alpaca open-orders snapshot contains an invalid side")
+
+            candidate_orders[order_id] = Order(
+                asset=asset,
+                side=(
+                    OrderSide.BUY if alpaca_order.side == AlpacaOrderSide.BUY else OrderSide.SELL
+                ),
+                quantity=quantity,
+                order_type=order_type,
+                limit_price=limit_price,
+                stop_price=stop_price,
+                order_id=order_id,
+                status=OrderStatus.PENDING,
+                created_at=created_at,
+            )
+            candidate_map[venue_id] = (order_id, time.time())
+
+        async with self._order_lock:
+            self._pending_orders = candidate_orders
+            self._alpaca_order_map = candidate_map
+            self._order_counter = next_order_counter
+
+        logger.info("AlpacaBroker: Synced %s open orders", len(self._pending_orders))

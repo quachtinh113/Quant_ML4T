@@ -1,0 +1,2672 @@
+"""Universal loader for Ch16-19 backtesting case study notebooks.
+
+Replaces the outdated 16_strategy_simulation/code/prediction_loader.py.
+Handles schema normalization across all 9 case studies and 5 model families.
+
+Functions:
+    load_backtest_predictions(): Load + normalize prediction artifacts
+    load_backtest_prices(): Load + normalize price data for DataFeed
+    build_target_weights(): Convert predictions → portfolio weights (delegated to utils.signals)
+    get_backtest_config(): Extract costs, calendar, rebalance config from setup.yaml
+    compute_allocator_metrics(): Compute 11-metric allocator summary in one call
+    compute_dsr_table(): DSR for all model variants (selection-bias accounting)
+    extract_daily_returns_frame(): Extract daily returns from BacktestResult
+    aggregate_timestamped_returns_to_daily(): Aggregate timestamped returns to daily
+    infer_session_alignment(): Infer whether returns need session alignment
+
+Usage:
+    from case_studies.utils.backtest_loaders import (
+        load_backtest_predictions,
+        load_backtest_prices,
+        build_target_weights,
+        get_backtest_config,
+        compute_allocator_metrics,
+        compute_dsr_table,
+    )
+"""
+
+from __future__ import annotations
+
+import re
+import sqlite3
+import warnings
+from dataclasses import dataclass, field
+from datetime import timedelta
+from functools import cache
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal
+
+import numpy as np
+import polars as pl
+import yaml
+
+from case_studies.utils.notebook_contracts import degenerate_prediction_sql
+from case_studies.utils.registry import model_source
+from case_studies.utils.signals import build_target_weights
+from case_studies.utils.sp500_price_lineage import adjustment_scale, continuous_adjusted_panel
+from utils.artifact_specs import resolve_market_runtime, resolve_market_semantics
+from utils.paths import get_case_study_dir
+
+if TYPE_CHECKING:
+    from ml4t.backtest.result import BacktestResult
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+ALL_CASE_STUDIES = [
+    "etfs",
+    "crypto_perps_funding",
+    "nasdaq100_microstructure",
+    "sp500_equity_option_analytics",
+    "us_firm_characteristics",
+    "fx_pairs",
+    "cme_futures",
+    "sp500_options",
+    "us_equities_panel",
+    # Bot case study (Route B fork of fx_pairs on MT5 history): bots/exness_fx_d1/BOT.md.
+    "exness_fx_d1",
+    # Bot case study (Route B fork of exness_fx_d1, session grid on MT5 H1 history):
+    # bots/exness_gold_sess/BOT.md. Its registry starts empty; every loader skips a case
+    # study without one.
+    "exness_gold_sess",
+    # Bot case study (Route B fork of exness_fx_d1, two NYSE cash-session decisions per day on
+    # MT5 H1 history): bots/exness_usidx_sess/BOT.md. Its registry starts empty.
+    "exness_usidx_sess",
+]
+
+MODEL_FAMILIES = ["linear", "gbm", "tabular_dl", "deep_learning", "latent_factors"]
+
+# Columns that could be entity identifiers in predictions
+_ENTITY_COLS = {"symbol", "product", "stock_id", "entity", "instrument_id", "asset"}
+
+# Columns that could be time identifiers
+_TIME_COLS = {"date", "timestamp", "session_date"}
+
+# Normalized output schema for predictions
+_PRED_SCHEMA = ["timestamp", "symbol", "y_score", "y_true", "fold_id", "model_id", "source"]
+
+# Case studies that use vectorized (non-Engine) backtesting
+VECTORIZED_CASE_STUDIES = {"us_firm_characteristics", "sp500_options"}
+
+
+@cache
+def _load_backtest_preset_config(case_study_id: str) -> dict:
+    """Load the case-study backtest preset if present."""
+    case_dir = get_case_study_dir(case_study_id)
+    path = case_dir / "config" / "backtest" / "base.yaml"
+    if not path.exists():
+        return {}
+    with path.open() as f:
+        data = yaml.safe_load(f) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _preset_requests_quotes(case_study_id: str) -> bool:
+    """Return True when the backtest preset requires bid/ask columns."""
+    preset = _load_backtest_preset_config(case_study_id)
+    feed = preset.get("feed", {})
+    execution = preset.get("execution", {})
+    return bool(feed.get("bid_col") or feed.get("ask_col")) or (
+        execution.get("execution_price") in {"bid", "ask", "quote_mid", "quote_side"}
+        or execution.get("mark_price") in {"bid", "ask", "quote_mid", "quote_side"}
+    )
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BacktestPredictions:
+    """Container for normalized prediction data."""
+
+    predictions: pl.DataFrame  # [timestamp, symbol, y_score, y_true, fold_id, model_id, source]
+    case_study_id: str
+    label: str
+    model_families: list[str]
+    n_assets: int
+    n_timestamps: int
+    date_range: tuple[str, str]
+    sources: dict[str, int] = field(default_factory=dict)  # {family: n_rows}
+    registry_entries: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class BacktestConfig:
+    """Configuration extracted from setup.yaml for backtesting."""
+
+    case_study_id: str
+    primary_label: str
+    label_buffer: str
+    calendar: str
+    cadence: str
+    execution_delay: str
+    commission_bps: float  # Normalized single number (midpoint of range)
+    slippage_bps: float  # Estimated slippage
+    costs_class: str  # "material" or "negligible"
+    long_short: bool
+    holdout_start: str
+    holdout_end: str
+    n_splits: int
+    raw_costs: dict  # Original costs section from setup.yaml
+    min_weight_change: float = 0.005  # Engine rebalance threshold (skip < this)
+    min_trade_value: float = 100.0  # Engine rebalance threshold (skip < this $)
+    initial_cash: float = 100_000.0  # SSOT — set from setup.yaml::execution.initial_cash
+    share_type: str = "integer"  # SSOT — set from setup.yaml::execution.share_type
+    # Per-label decision cadence, from setup.yaml::decision.cadence_by_label. `cadence` above is
+    # the case study's default and remains what an unlabelled caller gets. A case study whose
+    # labels span horizons cannot trade them all on one grid: holding a 5-day forecast for 21
+    # sessions is not the strategy the label describes, and the label then measures something the
+    # backtest never traded.
+    cadence_by_label: dict[str, str] = field(default_factory=dict)
+
+    def cadence_for(self, label: str | None = None) -> str:
+        """Return the decision cadence for ``label``, falling back to the case-study default.
+
+        A label with no entry in ``cadence_by_label`` trades on ``cadence``, so declaring nothing
+        reproduces the previous single-cadence behaviour exactly.
+        """
+        if not label:
+            return self.cadence
+        return self.cadence_by_label.get(label, self.cadence)
+
+
+def load_contract_specs_from_yaml(yaml_path: Path | None = None):
+    """Load futures contract specs from YAML, deriving multipliers from tick values."""
+    from ml4t.backtest import AssetClass, ContractSpec
+
+    if yaml_path is None:
+        repo_root = Path(__file__).resolve().parents[2]  # case_studies/utils/ → repo root
+        candidates = [
+            repo_root / "data" / "futures" / "market" / "futures_specs.yaml",
+            repo_root / "data" / "futures" / "futures_specs.yaml",
+            repo_root / "data" / "_archive" / "config" / "futures_specs.yaml",
+        ]
+        yaml_path = next((path for path in candidates if path.exists()), candidates[0])
+
+    with yaml_path.open() as f:
+        raw = yaml.safe_load(f)
+
+    specs = {}
+    for symbol, info in raw["products"].items():
+        init_pct = info.get("initial_margin_pct")
+        maint_pct = info.get("maintenance_margin_pct")
+        if (init_pct is None) != (maint_pct is None):
+            raise ValueError(
+                f"{symbol}: must specify both initial_margin_pct and "
+                f"maintenance_margin_pct or neither "
+                f"(got init={init_pct}, maint={maint_pct})"
+            )
+        margin_pct = (init_pct, maint_pct) if init_pct is not None else None
+        specs[symbol] = ContractSpec(
+            symbol=symbol,
+            asset_class=AssetClass.FUTURE,
+            multiplier=info["tick_value"] / info["tick_size"],
+            tick_size=info["tick_size"],
+            margin_pct=margin_pct,
+        )
+    return specs
+
+
+def load_futures_market_contract(products: list[str]) -> dict:
+    """Resolve the reader-visible roll and expiry contract for CME products."""
+    repo_root = Path(__file__).resolve().parents[2]
+    market_config = yaml.safe_load(
+        (repo_root / "data" / "futures" / "market" / "config.yaml").read_text()
+    )
+    product_specs = yaml.safe_load(
+        (repo_root / "data" / "futures" / "market" / "futures_specs.yaml").read_text()
+    )["products"]
+    if market_config.get("roll_type") != "v":
+        raise ValueError("CME backtesting requires the volume-rolled continuous series")
+    missing = sorted(set(products) - set(product_specs))
+    if missing:
+        raise ValueError(f"CME products have no expiry specification: {missing}")
+    expiry = {}
+    for product in sorted(set(products)):
+        spec = product_specs[product]
+        if not spec.get("expiry_rule") or not spec.get("contract_months"):
+            raise ValueError(f"{product} has an incomplete expiry specification")
+        expiry[product] = {
+            "contract_months": list(spec["contract_months"]),
+            "expiry_rule": str(spec["expiry_rule"]),
+        }
+    return {
+        "entity_key": "product",
+        "contract_position": 0,
+        "roll": {
+            "type": "volume",
+            "decision_information": "previous_session_volume",
+            "adjustment": "multiplicative_ratio",
+            "price_identity": "adj_close=raw_close*cum_ratio",
+        },
+        "expiry": {
+            "engine_behavior": "continuous_front_contract_has_no_delivery_event",
+            "products": expiry,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Prediction loading
+# ---------------------------------------------------------------------------
+
+
+def _detect_entity_col(df: pl.DataFrame) -> str | None:
+    """Detect entity column from a DataFrame."""
+    for col in _ENTITY_COLS:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _detect_time_col(df: pl.DataFrame) -> str | None:
+    """Detect time column from a DataFrame."""
+    for col in _TIME_COLS:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _normalize_predictions(
+    df: pl.DataFrame,
+    source: str,
+    case_study_id: str,
+) -> pl.DataFrame:
+    """Normalize a prediction DataFrame to the canonical schema.
+
+    Handles two prediction schemas:
+    - Linear: [date/timestamp, entity, fold, model, prediction, actual]
+    - GBM/DL/Latent: [date/timestamp, entity, y_true, y_score, fold_id, model_id]
+
+    Returns: [timestamp, symbol, y_score, y_true, fold_id, model_id, source]
+    """
+    time_col = _detect_time_col(df)
+    entity_col = _detect_entity_col(df)
+
+    if time_col is None:
+        msg = f"No time column found in {source} predictions for {case_study_id}. Columns: {df.columns}"
+        raise ValueError(msg)
+
+    # --- Rename columns to canonical names ---
+    renames = {}
+
+    # Time → timestamp
+    if time_col != "timestamp":
+        renames[time_col] = "timestamp"
+
+    # Entity → symbol
+    if entity_col and entity_col != "symbol" and "symbol" not in df.columns:
+        renames[entity_col] = "symbol"
+
+    # Linear schema: prediction→y_score, actual→y_true, fold→fold_id, model→model_id
+    if "prediction" in df.columns:
+        renames["prediction"] = "y_score"
+        renames["actual"] = "y_true"
+        renames["fold"] = "fold_id"
+        renames["model"] = "model_id"
+    elif "model_id" not in df.columns and "config" in df.columns:
+        renames["config"] = "model_id"
+
+    if renames:
+        df = df.rename(renames)
+
+    if case_study_id == "cme_futures" and "position" in df.columns:
+        df = df.filter(pl.col("position") == 0)
+
+    # --- Type normalization ---
+
+    # Cast date types to Datetime for consistent timestamp column
+    ts_dtype = df.schema["timestamp"]
+    if ts_dtype == pl.Date:
+        df = df.with_columns(pl.col("timestamp").cast(pl.Datetime("us")))
+    elif ts_dtype == pl.String or ts_dtype == pl.Utf8:
+        # String timestamps (e.g., latent_factors PCA) — parse to Datetime
+        df = df.with_columns(pl.col("timestamp").str.to_datetime().cast(pl.Datetime("us")))
+    elif hasattr(ts_dtype, "time_zone") and ts_dtype.time_zone:
+        # Strip timezone (crypto has UTC)
+        df = df.with_columns(pl.col("timestamp").dt.replace_time_zone(None))
+
+    # Ensure fold_id is Int64
+    if "fold_id" in df.columns and df.schema["fold_id"] != pl.Int64:
+        df = df.with_columns(pl.col("fold_id").cast(pl.Int64))
+
+    # Ensure model_id is String
+    if "model_id" in df.columns and df.schema["model_id"] != pl.String:
+        df = df.with_columns(pl.col("model_id").cast(pl.String))
+
+    # Ensure symbol is String (us_firm has UInt32 stock_id)
+    if "symbol" in df.columns and df.schema["symbol"] != pl.String:
+        df = df.with_columns(pl.col("symbol").cast(pl.String))
+
+    # Add source column
+    df = df.with_columns(pl.lit(source).alias("source"))
+
+    # Select only canonical columns (drop extras like position, instrument_id duplicates)
+    keep = [c for c in _PRED_SCHEMA if c in df.columns]
+    return df.select(keep)
+
+
+def _load_registry_prediction_frames(
+    case_study_id: str,
+    case_dir: Path,
+    label: str,
+    model_families: list[str],
+    split: str,
+    best_only: bool,
+) -> tuple[list[pl.DataFrame], dict[str, int], list[dict]]:
+    # Use the new registry at run_log/registry.db (SSOT since registry redesign)
+    db_path = case_dir / "run_log" / "registry.db"
+    if not db_path.exists():
+        return [], {}, []
+
+    requested = set(model_families)
+
+    # Query prediction_sets JOIN training_runs for label + split filtering
+    conn = sqlite3.connect(str(db_path))
+    try:
+        query = """
+            SELECT
+                p.prediction_hash,
+                p.training_hash,
+                p.split,
+                t.family,
+                t.config_name,
+                t.label,
+                t.created_at
+            FROM prediction_sets p
+            JOIN training_runs t ON p.training_hash = t.training_hash
+            WHERE t.label = ?
+        """
+        # Drop prediction sets with any constant-prediction (NULL-IC) fold so a
+        # degenerate L1/EN model is never backtested — see degenerate_prediction_sql().
+        query += degenerate_prediction_sql("p.prediction_hash")
+        params: list[str] = [label]
+
+        if split == "validation":
+            query += " AND p.split = 'validation'"
+        elif split == "holdout":
+            query += " AND p.split = 'holdout'"
+        # split == "all" → no additional filter
+
+        rows = conn.execute(query, params).fetchall()
+        col_names = [
+            "prediction_hash",
+            "training_hash",
+            "split",
+            "family",
+            "config_name",
+            "label",
+            "created_at",
+        ]
+    finally:
+        conn.close()
+
+    frames: list[pl.DataFrame] = []
+    sources: dict[str, int] = {}
+    entries: list[dict] = []
+
+    for row_tuple in rows:
+        row = dict(zip(col_names, row_tuple, strict=False))
+        family = str(row.get("family", "")).strip()
+        if family not in requested:
+            continue
+
+        prediction_hash = row["prediction_hash"]
+        pred_path = case_dir / "run_log" / "predictions" / prediction_hash / "predictions.parquet"
+        if not pred_path.exists():
+            continue
+
+        try:
+            raw = pl.read_parquet(pred_path)
+        except Exception as exc:
+            warnings.warn(f"Failed to read predictions {pred_path}: {exc}", stacklevel=2)
+            continue
+        if raw.is_empty():
+            continue
+
+        source = model_source(family, row.get("config_name"))
+        run_split = row.get("split", "validation")
+        if split == "all" and run_split == "holdout":
+            source = f"{source}/holdout"
+        normalized = _normalize_predictions(raw, source, case_study_id)
+
+        if best_only and family != "latent_factors":
+            normalized = _select_best_predictions(normalized)
+
+        frames.append(normalized)
+        source_counts = normalized.group_by("source").agg(n=pl.len())
+        for count_row in source_counts.iter_rows(named=True):
+            source_name = count_row["source"]
+            sources[source_name] = sources.get(source_name, 0) + count_row["n"]
+
+        entries.append(
+            {
+                "hash": prediction_hash,
+                "family": family,
+                "label": row.get("label"),
+                "created_at": row.get("created_at"),
+                "source": source,
+                "predictions_path": str(pred_path),
+            }
+        )
+
+    return frames, sources, entries
+
+
+def _load_cme_front_month_targets(case_dir: Path, label: str) -> pl.DataFrame | None:
+    label_path = case_dir / "labels" / f"{label}.parquet"
+    if not label_path.exists():
+        return None
+    try:
+        labels = pl.read_parquet(label_path)
+    except Exception as exc:
+        warnings.warn(f"Failed to read labels {label_path}: {exc}", stacklevel=2)
+        return None
+    if label not in labels.columns or "position" not in labels.columns:
+        return None
+    time_col = (
+        "timestamp"
+        if "timestamp" in labels.columns
+        else "date"
+        if "date" in labels.columns
+        else None
+    )
+    asset_col = (
+        "product"
+        if "product" in labels.columns
+        else "symbol"
+        if "symbol" in labels.columns
+        else None
+    )
+    if time_col is None or asset_col is None:
+        return None
+    return (
+        labels.filter(pl.col("position") == 0)
+        .select(
+            [
+                pl.col(time_col).cast(pl.Datetime("us")).alias("timestamp"),
+                pl.col(asset_col).cast(pl.String).alias("symbol"),
+                pl.col(label).cast(pl.Float64).alias("_front_y_true"),
+            ]
+        )
+        .unique(subset=["timestamp", "symbol"], keep="first")
+    )
+
+
+def _select_best_predictions(df: pl.DataFrame) -> pl.DataFrame:
+    """Select best model per fold from multi-model prediction files.
+
+    For files with multiple models (linear has 9+, GBM has multiple configs),
+    select the model with highest mean |y_score| correlation with y_true per fold.
+    """
+    if "model_id" not in df.columns:
+        return df
+
+    n_models = df["model_id"].n_unique()
+    if n_models <= 1:
+        return df
+
+    # Compute rank IC per model across all folds
+    model_ics = (
+        df.group_by("model_id")
+        .agg(
+            ic=pl.corr("y_score", "y_true", method="spearman"),
+            n_obs=pl.len(),
+        )
+        .sort("ic", descending=True)
+    )
+
+    best_model = model_ics.row(0, named=True)["model_id"]
+    return df.filter(pl.col("model_id") == best_model)
+
+
+def load_backtest_predictions(
+    case_study_id: str,
+    label: str | None = None,
+    model_families: list[str] | None = None,
+    best_only: bool = True,
+    split: str = "validation",
+    use_registry: bool | None = None,  # Deprecated — registry is always primary
+) -> BacktestPredictions:
+    """Load and normalize prediction artifacts for backtesting.
+
+    The model registry (``registry.db``) is the source of truth.
+    Predictions are loaded from content-addressed run directories
+    (``run_log/models/runs/{hash}/`` or ``models/runs/{hash}/``), keyed by
+    the registry's ``model_runs`` table.
+
+    Args:
+        case_study_id: Case study identifier (e.g., "etfs", "cme_futures")
+        label: Target label (e.g., "fwd_ret_21d"). None = primary from setup.yaml.
+        model_families: List of families to load. None = all available.
+        best_only: If True, select best model per family. If False, return all.
+        split: Which prediction split to load: "validation", "holdout", or "all".
+        use_registry: Deprecated — ignored. Registry is always used.
+
+    Returns:
+        BacktestPredictions with normalized [timestamp, symbol, y_score, y_true,
+        fold_id, model_id, source] DataFrame.
+    """
+    case_dir = get_case_study_dir(case_study_id)
+
+    # Resolve label from setup.yaml if not provided
+    if label is None:
+        setup = yaml.safe_load((case_dir / "config" / "setup.yaml").read_text())
+        label = setup["labels"]["primary"]
+
+    if model_families is None:
+        model_families = MODEL_FAMILIES
+
+    valid_splits = {"validation", "holdout", "all"}
+    if split not in valid_splits:
+        msg = f"Invalid split='{split}'. Must be one of {sorted(valid_splits)}"
+        raise ValueError(msg)
+
+    cme_front_targets = (
+        _load_cme_front_month_targets(case_dir, label) if case_study_id == "cme_futures" else None
+    )
+
+    # --- Primary source: registry-backed content-addressed runs ---
+    frames, sources, registry_entries = _load_registry_prediction_frames(
+        case_study_id=case_study_id,
+        case_dir=case_dir,
+        label=label,
+        model_families=model_families,
+        split=split,
+        best_only=best_only,
+    )
+
+    if not frames:
+        msg = f"No predictions found for {case_study_id}/{label} in families {model_families}"
+        raise FileNotFoundError(msg)
+
+    predictions = pl.concat(frames, how="diagonal_relaxed")
+    if case_study_id == "cme_futures":
+        if (
+            cme_front_targets is not None
+            and "timestamp" in predictions.columns
+            and cme_front_targets.schema.get("timestamp") != predictions.schema.get("timestamp")
+        ):
+            cme_front_targets = cme_front_targets.with_columns(
+                pl.col("timestamp").cast(predictions.schema["timestamp"])
+            )
+        base_sort = ["timestamp", "symbol", "source"]
+        fold_sort = ["fold_id"] if "fold_id" in predictions.columns else []
+        fold_desc = [True] if fold_sort else []
+        if cme_front_targets is not None and {"timestamp", "symbol", "y_true"}.issubset(
+            predictions.columns
+        ):
+            predictions = predictions.join(
+                cme_front_targets, on=["timestamp", "symbol"], how="left"
+            )
+            predictions = predictions.with_columns(
+                (pl.col("y_true") - pl.col("_front_y_true")).abs().alias("_front_err")
+            )
+            predictions = predictions.sort(
+                by=base_sort + ["_front_err"] + fold_sort,
+                descending=[False, False, False, False] + fold_desc,
+                nulls_last=True,
+            )
+            predictions = predictions.unique(subset=["timestamp", "symbol", "source"], keep="first")
+            predictions = predictions.drop(["_front_y_true", "_front_err"])
+        else:
+            predictions = predictions.sort(
+                by=base_sort + fold_sort,
+                descending=[False, False, False] + fold_desc,
+                nulls_last=True,
+            ).unique(subset=["timestamp", "symbol", "source"], keep="first")
+        predictions = predictions.sort(["source", "timestamp", "symbol"])
+        sources = {
+            row["source"]: row["n"]
+            for row in predictions.group_by("source").agg(pl.len().alias("n")).iter_rows(named=True)
+        }
+
+    # Compute summary stats
+    n_assets = predictions["symbol"].n_unique() if "symbol" in predictions.columns else 0
+    ts_col = "timestamp"
+    n_timestamps = predictions[ts_col].n_unique()
+    date_range = (
+        str(predictions[ts_col].min()),
+        str(predictions[ts_col].max()),
+    )
+
+    return BacktestPredictions(
+        predictions=predictions,
+        case_study_id=case_study_id,
+        label=label,
+        model_families=[f for f in model_families if any(s.startswith(f) for s in sources)],
+        n_assets=n_assets,
+        n_timestamps=n_timestamps,
+        date_range=date_range,
+        sources=sources,
+        registry_entries=registry_entries,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Price loading
+# ---------------------------------------------------------------------------
+
+# Per-case-study price normalization config
+_PRICE_CONFIG = {
+    "etfs": {
+        "entity_col": "symbol",
+        "time_col": "timestamp",
+        "close_col": "close",
+        "ohlcv": True,
+        "loader": "etfs",
+        "drop_cols": [],
+    },
+    "crypto_perps_funding": {
+        "entity_col": "symbol",
+        "time_col": "timestamp",
+        "close_col": "close",
+        "ohlcv": True,
+        "loader": "crypto_perps",
+        "drop_cols": [
+            "premium_index_open",
+            "premium_index_high",
+            "premium_index_low",
+            "premium_index_close",
+        ],
+    },
+    "nasdaq100_microstructure": {
+        "entity_col": "symbol",
+        "time_col": "timestamp",
+        "close_col": "close",
+        "ohlcv": True,
+        "loader": "nasdaq100_bars",
+        "drop_cols": [],
+    },
+    "sp500_equity_option_analytics": {
+        "entity_col": "symbol",
+        "time_col": "timestamp",
+        "close_col": "close",
+        "ohlcv": True,
+        "loader": "sp500_daily_bars",
+        # Backtest fills ride the same split- and dividend-adjusted series that
+        # 02_labels builds every label from (``close * adj_factor`` within a
+        # ``sec_id``). On the printed close 92 sessions in 2017-2021 carry a move
+        # above 30% that is a corporate action rather than a price change - GE
+        # +677% on its 1-for-8 reverse split, NVDA -75% and NEE -75% on 4-for-1
+        # subdivisions - and each one books as P&L.
+        "price_lineage": "sp500_daily_bars",
+        "drop_cols": [
+            "sec_id",
+            "adj_factor",
+            "vol_adj_factor",
+            "adjustment_factor",
+            "adjustment_reason",
+        ],
+    },
+    "us_firm_characteristics": {
+        "entity_col": "symbol",
+        "time_col": "timestamp",
+        "close_col": None,  # No OHLCV — uses ret column for decile portfolio
+        "ohlcv": False,
+        # No loader — uses materialized prices.parquet (returns-only, no OHLCV source)
+        "drop_cols": [],
+    },
+    "fx_pairs": {
+        "entity_col": "symbol",
+        "time_col": "timestamp",
+        "close_col": "close",
+        "ohlcv": True,
+        "loader": "fx_pairs",
+        "drop_cols": [],
+    },
+    "exness_fx_d1": {
+        "entity_col": "symbol",
+        "time_col": "timestamp",
+        "close_col": "close",
+        "ohlcv": True,
+        # MT5 H4 bars aggregated to CME_FX sessions closed on the decision bar, the same
+        # function 02_labels sealed the labels on (case_studies/exness_fx_d1/_features.py).
+        "loader": "exness_fx_d1",
+        "drop_cols": [],
+    },
+    "exness_gold_sess": {
+        "entity_col": "symbol",
+        "time_col": "timestamp",
+        "close_col": "close",
+        "ohlcv": True,
+        # RAW MT5 H1 bars of both metals, keyed on the BAR CLOSE, with no session cropping.
+        # Declared by bots/exness_gold_sess/PRICE_GRID_DECLARATION.md section 1.1 on 2026-09-08,
+        # with run_log/ empty, replacing the session panel this key used to name.
+        #
+        # Why the raw hourly grid and not the decision panel: the engine can only change a
+        # position at a row of the grid it is given, so a panel with one row per decision
+        # instant can express only a 5-hour (London) or 19-hour (New York) hold against an
+        # 8-hour label. The hold itself is NOT expressed by the grid spacing here - it is a
+        # broker-level TimeExit position rule (section 3.2) - and the intervening bars are what
+        # the stop and trailing rules of Ch19 read. Sessions are not cropped out: not trading
+        # outside a session is guaranteed by the rebalance schedule (which is built from the
+        # PREDICTION timestamps, backtest_runner.py:1408-1410), never by deleting price rows.
+        #
+        # Why bar-close keying: config/backtest/base.yaml keeps execution_price: open and
+        # execution_mode: next_bar. A weight written at the 09:00 decision matches the row
+        # "bar that closed at 09:00", and next_bar fills at the open of the row that closes at
+        # 10:00 - i.e. the 09:00-10:00 bar's open, which is exactly the fill price
+        # _features.py:410-421 uses on the session panel. Keyed on the bar OPEN instead, the
+        # same config would fill an hour late and no cost number would compare with
+        # exness_fx_d1's.
+        "loader": "exness_gold_sess_h1",
+        "drop_cols": [],
+    },
+    "exness_usidx_sess": {
+        "entity_col": "symbol",
+        "time_col": "timestamp",
+        "close_col": "close",
+        "ohlcv": True,
+        # RAW MT5 H1 bars of both indices, keyed on the BAR CLOSE, not cropped to session
+        # hours - the same grid and the same reasoning as exness_gold_sess above.
+        #
+        # This bot decides twice a session and holds for about six hours (the intraday spec) or
+        # about seventeen (the overnight spec). A panel with one row per decision instant can
+        # express neither: the engine can only change a position at a row of the grid it is
+        # given, so two rows a day would turn both specs into the same hold. Not trading outside
+        # a session is guaranteed by the rebalance schedule, which is built from the PREDICTION
+        # timestamps, never by deleting price rows.
+        #
+        # Bar-close keying: config/backtest/base.yaml keeps execution_price: open and
+        # execution_mode: next_bar. A weight written at a decision instant matches the row "bar
+        # that closed at that instant", and next_bar fills at the open of the following hour -
+        # which is exactly the `exec_open` price _features.session_panel seals the label on.
+        "loader": "exness_usidx_sess_h1",
+        "drop_cols": [],
+    },
+    "xau_fx_mt5": {
+        "entity_col": "symbol",
+        "time_col": "timestamp",
+        "close_col": "close",
+        "ohlcv": True,
+        # MT5 H1 bars of the bot's point-in-time panel (experiments/xau_fx_mt5/data/build_panel.py,
+        # read only through read_development): bots/xau_fx_mt5/BOT.md, Route B fork of fx_pairs.
+        "loader": "xau_fx_mt5",
+        "drop_cols": [],
+    },
+    "cme_futures": {
+        "entity_col": "product",
+        "time_col": "session_date",
+        "close_col": "adj_close",
+        "ohlcv": True,
+        "loader": "cme_futures",
+        # Backtest fills ride the roll-adjusted series (continuous PnL); rename
+        # adj_* → bare OHLC and drop the raw term-structure series + roll multiplier.
+        "rename_cols": {
+            "adj_open": "open",
+            "adj_high": "high",
+            "adj_low": "low",
+            "adj_close": "close",
+        },
+        "drop_cols": [
+            "raw_open",
+            "raw_high",
+            "raw_low",
+            "raw_close",
+            "cum_ratio",
+            "bar_count",
+            "session_start",
+            "session_end",
+        ],
+        "filter": {"tenor": 0},  # Front-month only
+    },
+    "sp500_options": {
+        "entity_col": "symbol",
+        "time_col": "timestamp",
+        "close_col": "underlying_price",  # No standard OHLCV
+        "ohlcv": False,
+        "loader": "sp500_options_straddles",
+        "drop_cols": ["qc_any_estimated_iv"],
+    },
+    "us_equities_panel": {
+        "entity_col": "symbol",
+        "time_col": "timestamp",
+        "close_col": "adj_close",
+        "ohlcv": True,
+        "loader": "us_equities",
+        "rename_cols": {
+            "adj_open": "open",
+            "adj_high": "high",
+            "adj_low": "low",
+            "adj_close": "close",
+            "adj_volume": "volume",
+        },
+        # Drop raw OHLCV before adj_ rename to avoid duplicate columns
+        "drop_cols": [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "ex-dividend",
+            "split_ratio",
+            "returns",
+            "adv_21d",
+        ],
+    },
+    "exness_btc_8h": {
+        "entity_col": "symbol",
+        "time_col": "timestamp",
+        "close_col": "close",
+        "ohlcv": True,
+        # The native 8-hour decision grid itself, keyed on the bar CLOSE - the same grid
+        # 02_labels seals the label on (bots/exness_btc_8h/BOT.md, setup.yaml::backtest.
+        # price_grid_expresses_primary_label: true; entry and exit of fwd_ret_8h are two
+        # CONSECUTIVE rows). Much smaller registration than exness_gold_sess's dedicated H1
+        # loader: this bot has no finer intraday tape to key a stop or trailing rule on, so
+        # there is nothing to fold except the H4 -> 8h step 03_financial_features already does.
+        "loader": "exness_btc_8h_8h",
+        "drop_cols": [],
+    },
+}
+
+
+@cache
+def _sp500_daily_bars_scale() -> pl.DataFrame:
+    """Resolve the back-adjustment scale once, over the complete bar history.
+
+    The panel handed to the rule is already narrowed by the ``start_date`` /
+    ``end_date`` pushdown, and the scale must not be: it depends on every segment
+    a ticker has and on which row is its last, so deriving it from the window
+    would make the same session's price depend on the query that asked for it.
+    """
+    from data import load_sp500_daily_bars
+
+    return adjustment_scale(load_sp500_daily_bars())
+
+
+def _sp500_daily_bars_lineage(df: pl.DataFrame) -> pl.DataFrame:
+    return continuous_adjusted_panel(df, scale=_sp500_daily_bars_scale())
+
+
+# Named price-lineage rules a panel spec may request, applied before any column
+# the rule reads can be dropped.
+_PRICE_LINEAGE = {"sp500_daily_bars": _sp500_daily_bars_lineage}
+
+
+def _naive_end_date_string(value: object) -> str:
+    """Coerce an ``end_date`` of any type this dispatcher's callers use to a bare
+    ``"YYYY-MM-DD"`` string, EXPLICITLY, so a polars date/datetime comparison downstream can
+    never raise on a naive-vs-timezone-aware mismatch (fleet mentor material #3, 2026-09-10).
+
+    Accepts a ``datetime.date``, a ``datetime.datetime`` (naive or timezone-aware - an aware
+    one is converted to UTC before the time-of-day and zone are both dropped), or a string
+    (``"YYYY-MM-DD"``, an ISO datetime, or anything else whose first 10 characters are the
+    calendar day - only the DAY matters for a ``+1 day`` boundary clip, so nothing past index 10
+    is read). Never returns a value carrying a time zone: the loader branches that use this
+    build a NAIVE polars literal from it, matching the NAIVE ``timestamp`` column every branch
+    produces (``decision_grid`` and its H1 siblings above all strip any time zone before this
+    point is ever reached).
+    """
+    from datetime import date as _date
+    from datetime import datetime as _datetime
+    from datetime import timezone as _timezone
+
+    if isinstance(value, _datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(_timezone.utc).replace(tzinfo=None)
+        return value.date().isoformat()
+    if isinstance(value, _date):
+        return value.isoformat()
+    return str(value)[:10]
+
+
+def _load_via_canonical(
+    loader_name: str,
+    max_symbols: int = 0,
+    frequency: str = "",
+    include_quotes: bool = False,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pl.DataFrame:
+    """Dispatch to canonical data loaders instead of reading prices.parquet."""
+    if loader_name == "etfs":
+        from data import load_etfs
+
+        return load_etfs(max_symbols=max_symbols, start_date=start_date, end_date=end_date)
+    if loader_name == "crypto_perps":
+        from data import load_crypto_perps
+
+        return load_crypto_perps(
+            frequency="8h",
+            max_symbols=max_symbols,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    if loader_name == "fx_pairs":
+        from data import load_fx_pairs
+
+        return load_fx_pairs(
+            frequency="daily",
+            max_symbols=max_symbols,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    if loader_name == "exness_fx_d1":
+        from case_studies.exness_fx_d1._features import load_session_panel
+        from utils.artifact_specs import load_setup_config
+
+        # One session row per pair: open = first bar after the previous decision (the
+        # next_bar_open fill), close = the decision bar's close (the label price).
+        return load_session_panel(
+            load_setup_config("exness_fx_d1"),
+            start_date=start_date,
+            end_date=end_date,
+            max_symbols=max_symbols,
+            verbose=False,
+        )
+    if loader_name == "exness_gold_sess_h1":
+        from bots._shared.mt5_loader import load_mt5_bars
+        from utils.artifact_specs import load_setup_config
+        from utils.data_quality import apply_max_symbols
+
+        # The registered price grid of this bot since 2026-09-08: raw MT5 H1 bars of both
+        # metals over the declared universe window, keyed on the BAR CLOSE and NOT cropped to
+        # session hours (bots/exness_gold_sess/PRICE_GRID_DECLARATION.md section 1.1).
+        #
+        # The +60 minutes is the whole point and not a cosmetic shift. `load_mt5_bars` keys a
+        # bar on its OPEN; every decision instant of this bot is a bar CLOSE
+        # (_features.py:390-392: ``bar_close = timestamp + 60m``, and the session panel's
+        # ``timestamp`` IS a bar close). Shifting here makes every decision instant a row of
+        # this grid - a subset, so no prediction has to be joined as-of - and makes
+        # ``execution_price: open`` + ``execution_mode: next_bar`` fill at the price the
+        # session panel called the fill (the open of the hour that follows the decision).
+        setup = load_setup_config("exness_gold_sess")
+        bars = load_mt5_bars(
+            "1h",
+            symbols=sorted(setup["universe"]["symbols"]),
+            start_date=start_date or str(setup["universe"]["history_start"]),
+            end_date=end_date,
+        )
+        _ts_dtype = bars.schema["timestamp"]
+        if isinstance(_ts_dtype, pl.Datetime) and _ts_dtype.time_zone is not None:
+            bars = bars.with_columns(
+                pl.col("timestamp").dt.convert_time_zone("UTC").dt.replace_time_zone(None)
+            )
+        bars = bars.with_columns(
+            (pl.col("timestamp").cast(pl.Datetime("us")) + pl.duration(minutes=60)).alias(
+                "timestamp"
+            )
+        ).sort(["symbol", "timestamp"])
+        return apply_max_symbols(bars, max_symbols)
+    if loader_name == "exness_gold_sess":
+        from case_studies.exness_gold_sess._features import load_session_panel
+        from utils.artifact_specs import load_setup_config
+
+        # KEPT DELIBERATELY, AND IT RAISES. This branch is no longer on the run path -
+        # _PRICE_CONFIG["exness_gold_sess"] names "exness_gold_sess_h1" above - and it is kept
+        # as the guard against anyone registering the SESSION PANEL as the price grid again.
+        # One row per decision instant can express only a 5-hour (London) or 19-hour (New York)
+        # hold, while the primary label fwd_ret_8h runs 8 hours to the session close; a backtest
+        # there would trade a horizon nobody trained on and fire no assertion downstream.
+        # load_session_panel(for_backtest=True) raises with that explanation.
+        return load_session_panel(
+            load_setup_config("exness_gold_sess"),
+            start_date=start_date,
+            end_date=end_date,
+            max_symbols=max_symbols,
+            verbose=False,
+            for_backtest=True,
+        )
+    if loader_name == "exness_usidx_sess_h1":
+        from bots._shared.mt5_loader import load_mt5_bars
+        from utils.artifact_specs import load_setup_config
+        from utils.data_quality import apply_max_symbols
+
+        # Raw MT5 H1 bars of US500 and USTEC over the declared universe window, keyed on the
+        # BAR CLOSE. `load_mt5_bars` keys a bar on its OPEN; every decision instant of this bot
+        # is a bar CLOSE (case_studies/exness_usidx_sess/_features.py), so the +60 minutes is
+        # what makes every decision instant a row of this grid and makes
+        # `execution_price: open` + `execution_mode: next_bar` fill at the open of the hour that
+        # follows the decision - the price the label was sealed on.
+        setup = load_setup_config("exness_usidx_sess")
+        bars = load_mt5_bars(
+            "1h",
+            symbols=sorted(setup["universe"]["symbols"]),
+            start_date=start_date or str(setup["universe"]["history_start"]),
+            end_date=end_date,
+        )
+        _ts_dtype = bars.schema["timestamp"]
+        if isinstance(_ts_dtype, pl.Datetime) and _ts_dtype.time_zone is not None:
+            bars = bars.with_columns(
+                pl.col("timestamp").dt.convert_time_zone("UTC").dt.replace_time_zone(None)
+            )
+        bars = bars.with_columns(
+            (pl.col("timestamp").cast(pl.Datetime("us")) + pl.duration(minutes=60)).alias(
+                "timestamp"
+            )
+        ).sort(["symbol", "timestamp"])
+        # Re-window AFTER the shift. `load_mt5_bars` filtered on the bar OPEN, so the last row of
+        # `end_date` opens at 23:00 and now closes at 00:00 on `end_date + 1` - a date the
+        # canonical split window does not contain, which the engine's pre-windowing check refuses.
+        # Truncating here loses no fill and no mark: every decision instant of this bot falls
+        # between 14:00 and 21:00 UTC, so the only row dropped is one that closed after the window.
+        if end_date:
+            bars = bars.filter(
+                pl.col("timestamp")
+                < pl.lit(str(end_date)).str.to_datetime() + pl.duration(days=1)
+            )
+        return apply_max_symbols(bars, max_symbols)
+    if loader_name == "xau_fx_mt5":
+        from case_studies.xau_fx_mt5._panel import load_panel_bars
+
+        # One H1 bar per symbol (decision.cadence hourly_bar_close): the next_bar_open fill is the
+        # open of the following H1 bar, the mark is the decision bar's close.
+        #
+        # include_spread=True unconditionally (mentor gate finding B1, 2026-09-10): harmless for
+        # callers that ignore the extra `spread` column (it is just one more OHLCV-shaped
+        # column), and it is what run_backtest's opt-in "spread_column" cost model (guard c)
+        # needs present on the `prices` frame it hands to `_run_vectorized`. Without this the
+        # loader silently returned a frame with no spread column at all and the cost branch
+        # raised on the first real run.
+        return load_panel_bars(
+            "1h",
+            max_symbols=max_symbols,
+            start_date=start_date,
+            end_date=end_date,
+            include_spread=True,
+        )
+    if loader_name == "cme_futures":
+        from data import load_cme_futures
+
+        return load_cme_futures(
+            max_symbols=max_symbols,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    if loader_name == "sp500_daily_bars":
+        from data.equities.loader import load_sp500_daily_bars
+
+        return load_sp500_daily_bars(
+            max_symbols=max_symbols,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    if loader_name == "sp500_options_straddles":
+        from data import load_sp500_options_straddles
+
+        return load_sp500_options_straddles(
+            max_symbols=max_symbols,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    if loader_name == "us_equities":
+        from data import load_us_equities
+
+        return load_us_equities(
+            max_symbols=max_symbols,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    if loader_name == "nasdaq100_bars":
+        from data.equities.loader import load_nasdaq100_bars
+
+        # The bar this case study is sampled at. A caller that wants a coarser grid asks for
+        # one; the default must not silently resample, which is how a fifteen-minute backtest
+        # came to hold an interval the minute-level labels never predicted (#187).
+        freq = frequency or "1m"
+        return load_nasdaq100_bars(
+            frequency=freq,
+            max_symbols=max_symbols,
+            include_quotes=include_quotes,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    if loader_name == "exness_btc_8h_8h":
+        from bots._shared.mt5_loader import load_mt5_bars
+        from case_studies.exness_btc_8h._features import decision_grid
+        from utils.artifact_specs import load_setup_config
+        from utils.data_quality import apply_max_symbols
+
+        # The registered price grid of this bot since 2026-09-10 (fleet mentor gate #5): the
+        # NATIVE 8-hour decision grid itself, keyed on the bar CLOSE - the same panel
+        # `02_labels` seals the primary label on (`setup.yaml::backtest.
+        # price_grid_expresses_primary_label: true`). Reuses `decision_grid` rather than
+        # reimplementing the +480-minute shift inline (the pattern `exness_gold_sess_h1` and
+        # `exness_usidx_sess_h1` use above): `decision_grid` is the SAME function
+        # `01_feasibility_analysis`, `02_labels` and every test in
+        # `bots/exness_btc_8h/tests/` already exercise, so the price grid and the label grid
+        # cannot drift apart by having two implementations of one shift.
+        setup = load_setup_config("exness_btc_8h")
+        # Coerced ONCE, reused for both the load and the re-window below - `load_mt5_bars`
+        # itself expects a bare "YYYY-MM-DD" string (`bots/_shared/mt5_loader.py`'s own
+        # `end_date` builds a polars string literal internally and raises a SchemaError on a
+        # `date`/`datetime` object), and passing a coerced value to it fixes that call site too
+        # rather than only the re-window clip (fleet mentor material #3, 2026-09-10).
+        end_date_str = _naive_end_date_string(end_date) if end_date else None
+        bars = load_mt5_bars(
+            "8h",
+            symbols=sorted(setup["universe"]["symbols"]),
+            start_date=start_date or str(setup["universe"]["history_start"]),
+            end_date=end_date_str,
+        )
+        panel = decision_grid(bars, verbose=False).select(
+            ["symbol", "timestamp", "open", "high", "low", "close", "volume"]
+        )
+        # Re-window AFTER the close-side shift - the SAME re-window `exness_usidx_sess_h1`
+        # applies above, for the same reason, MEASURED here rather than assumed: `load_mt5_bars`
+        # bounds the raw, OPEN-keyed bars inclusively through the whole `end_date` day, so the
+        # last 8h bar of `end_date` OPENS at 16:00 that day and, once `decision_grid` shifts it
+        # to its CLOSE, is keyed at 00:00 the FOLLOWING day - `>= end_date + 1 day`, one decision
+        # instant later than the caller asked for. Uncaught, a caller that bounds `end_date` to
+        # the day before `holdout_start` (2025-08-31, to keep the development path strictly
+        # before 2025-09-01) would get one row keyed exactly AT holdout_start - a one-row
+        # holdout leak, found and pinned in
+        # `bots/exness_btc_8h/tests/test_price_config_diff.py::
+        # TestCloseKeyedGridItem3::test_naive_end_date_bound_leaks_one_close_keyed_row_past_holdout_start`
+        # before this branch was written.
+        #
+        # THE CLIP ONLY RUNS WHEN end_date IS GIVEN (fleet mentor material #3, 2026-09-10): a
+        # caller that asks for the whole history (``end_date=None``) gets the whole history,
+        # unclipped - there is no boundary to guard against.
+        #
+        # `end_date_str` (coerced once, above, before `load_mt5_bars` was even called) is
+        # reused here rather than re-deriving from `end_date`. Callers pass a `date`, a naive
+        # or TZ-AWARE `datetime`, or a bare `"YYYY-MM-DD"` string (`load_backtest_prices_for`
+        # passes a `date.isoformat()` string; a direct caller could pass any of the other
+        # three); `panel["timestamp"]` is always NAIVE by this point (`decision_grid` already
+        # strips any time zone). Parsing an uncoerced value straight through
+        # `pl.lit(...).str.to_datetime()` - the bug this coercion replaces - would either raise
+        # a `SchemaError` (a `date`/`datetime` object is not a string) or, for a TZ-AWARE
+        # string, produce a TZ-AWARE polars literal whose comparison against the naive
+        # `panel["timestamp"]` raises `InvalidOperationError` (naive vs aware); a stage that
+        # raises on a valid caller's `end_date` is broken, so the coercion is explicit and
+        # type-checked rather than left to polars' string inference to guess right.
+        if end_date_str:
+            panel = panel.filter(
+                pl.col("timestamp")
+                < pl.lit(end_date_str).str.to_date().cast(pl.Datetime("us")) + pl.duration(days=1)
+            )
+        return apply_max_symbols(panel, max_symbols)
+    msg = f"Unknown loader: {loader_name}"
+    raise ValueError(msg)
+
+
+def load_backtest_prices(
+    case_study_id: str,
+    max_symbols: int = 0,
+    frequency: str = "",
+    include_quotes: bool = False,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pl.DataFrame:
+    """Load and normalize price data for DataFeed consumption.
+
+    Returns a DataFrame with columns [timestamp, symbol, open, high, low, close, volume]
+    for standard case studies, or case-study-specific columns for special cases
+    (us_firm: ret, sp500_options: instrument-level).
+
+    Args:
+        case_study_id: Case study identifier
+        max_symbols: Limit universe size (0 = all)
+        frequency: Bar frequency override for loader-backed case studies (e.g. "1m",
+            "15m", "1h"). Empty string uses the default for the case study.
+        include_quotes: If True, include bid/ask OHLCV columns (loader-backed only).
+            Use for risk-layer stop monitoring with bid/ask-aware execution.
+        start_date: Optional lower bound (``YYYY-MM-DD``) pushed into the parquet
+            read for row-group pruning. Callers SHOULD pass the canonical
+            ``(cs, label, split)`` window so memory scales with the window
+            rather than the full history — see ``load_backtest_prices_for``
+            for the convenience that resolves the window from
+            ``canonical_window``.
+        end_date: Optional upper bound (``YYYY-MM-DD``) pushed into the parquet
+            read.
+
+    Returns:
+        Normalized price DataFrame ready for DataFeed
+    """
+    config = dict(_PRICE_CONFIG[case_study_id])
+    runtime = resolve_market_runtime(case_study_id)
+    if runtime:
+        for key in ("entity_col", "time_col", "close_col", "ohlcv", "loader", "prices_file"):
+            if runtime.get(key) is not None:
+                config[key] = runtime[key]
+        if "drop_cols" in runtime:
+            config["drop_cols"] = list(runtime["drop_cols"])
+        if "rename_cols" in runtime:
+            config["rename_cols"] = dict(runtime["rename_cols"])
+        if "filter" in runtime:
+            config["filter"] = dict(runtime["filter"])
+
+    effective_frequency = frequency or str(runtime.get("frequency", ""))
+    effective_include_quotes = (
+        include_quotes
+        or bool(runtime.get("include_quotes", False))
+        or _preset_requests_quotes(case_study_id)
+    )
+    loader_name = config.get("loader")
+
+    # Canonical loader dispatch — avoids materialized prices.parquet for most CS
+    if loader_name:
+        df = _load_via_canonical(
+            loader_name,
+            max_symbols,
+            effective_frequency,
+            effective_include_quotes,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        # Apply post-load filters (e.g., CME front-month: tenor=0)
+        if "filter" in config:
+            for col, val in config["filter"].items():
+                df = df.filter(pl.col(col) == val)
+    else:
+        # File-backed fallback: US Firms (returns-only) and SP500 Options (straddles).
+        # Apply date filters lazily so parquet row-group pruning kicks in.
+        case_dir = get_case_study_dir(case_study_id)
+        prices_file = config.get("prices_file", "prices.parquet")
+        prices_path = case_dir / "labels" / prices_file
+        lf = pl.scan_parquet(prices_path)
+        if "filter" in config:
+            for col, val in config["filter"].items():
+                lf = lf.filter(pl.col(col) == val)
+        # Date pushdown — resolve dtype-aware comparison
+        if start_date or end_date:
+            ts_col = config.get("time_col", "timestamp")
+            if ts_col not in lf.collect_schema().names():
+                ts_col = "timestamp" if "timestamp" in lf.collect_schema().names() else "date"
+            ts_type = lf.collect_schema()[ts_col]
+            tz = getattr(ts_type, "time_zone", None)
+            is_date = ts_type == pl.Date
+            if start_date:
+                lit = (
+                    pl.lit(start_date).str.to_date()
+                    if is_date
+                    else pl.lit(start_date).str.to_datetime()
+                )
+                if tz and not is_date:
+                    lit = lit.dt.replace_time_zone(tz)
+                lf = lf.filter(pl.col(ts_col) >= lit)
+            if end_date:
+                if is_date:
+                    lf = lf.filter(pl.col(ts_col) <= pl.lit(end_date).str.to_date())
+                else:
+                    end_lit = pl.lit(end_date).str.to_datetime()
+                    if tz:
+                        end_lit = end_lit.dt.replace_time_zone(tz)
+                    lf = lf.filter(pl.col(ts_col) < end_lit + pl.duration(days=1))
+        df = lf.collect()
+
+    # Resolve the price lineage before drop_cols removes what the rule reads
+    if "price_lineage" in config:
+        df = _PRICE_LINEAGE[config["price_lineage"]](df)
+
+    # Drop unwanted columns
+    drop = [c for c in config.get("drop_cols", []) if c in df.columns]
+    if drop:
+        df = df.drop(drop)
+
+    # Apply renames (us_equities adj_ columns)
+    if "rename_cols" in config:
+        renames = {k: v for k, v in config["rename_cols"].items() if k in df.columns}
+        if renames:
+            df = df.rename(renames)
+
+    # Rename close column if non-standard
+    close_col = config.get("close_col")
+    if close_col and close_col != "close" and close_col in df.columns:
+        df = df.rename({close_col: "close"})
+
+    # Rename entity → symbol
+    entity_col = config["entity_col"]
+    if entity_col not in df.columns:
+        detected_entity = _detect_entity_col(df)
+        if detected_entity is None:
+            msg = f"No entity column found for {case_study_id}. Columns: {df.columns}"
+            raise KeyError(msg)
+        entity_col = detected_entity
+    if entity_col != "symbol" and entity_col in df.columns:
+        df = df.rename({entity_col: "symbol"})
+
+    # Ensure symbol is String
+    if "symbol" in df.columns and df.schema["symbol"] != pl.String:
+        df = df.with_columns(pl.col("symbol").cast(pl.String))
+
+    # Rename time → timestamp and cast to Datetime
+    time_col = config["time_col"]
+    if time_col not in df.columns:
+        detected_time = _detect_time_col(df)
+        if detected_time is None:
+            msg = f"No time column found for {case_study_id}. Columns: {df.columns}"
+            raise KeyError(msg)
+        time_col = detected_time
+    if time_col != "timestamp" and time_col in df.columns:
+        df = df.rename({time_col: "timestamp"})
+
+    if df.schema["timestamp"] == pl.Date:
+        df = df.with_columns(pl.col("timestamp").cast(pl.Datetime("ms")))
+    elif hasattr(df.schema["timestamp"], "time_zone") and df.schema["timestamp"].time_zone:
+        df = df.with_columns(pl.col("timestamp").dt.replace_time_zone(None))
+
+    # Drop filter columns that are no longer needed (e.g., position for CME)
+    if "filter" in config:
+        for col in config["filter"]:
+            if col in df.columns:
+                df = df.drop(col)
+
+    # Universe reduction
+    if max_symbols > 0 and "symbol" in df.columns:
+        top_symbols = (
+            df.group_by("symbol")
+            .agg(pl.len().alias("n"))
+            .sort("n", descending=True)
+            .head(max_symbols)["symbol"]
+        )
+        df = df.filter(pl.col("symbol").is_in(top_symbols.implode()))
+
+    return df.sort("timestamp", "symbol")
+
+
+@cache
+def _load_case_setup_yaml(case_study_id: str) -> dict:
+    """Cached read of the case study's setup.yaml. Returns {} when missing."""
+    setup_path = get_case_study_dir(case_study_id) / "config" / "setup.yaml"
+    if not setup_path.exists():
+        return {}
+    with setup_path.open() as f:
+        data = yaml.safe_load(f) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def warmup_periods_for(case_study_id: str) -> int:
+    """Resolve the per-CS warmup period count from setup.yaml.
+
+    Returns ``max(execution.allocator_lookback, max sweep allocator
+    {vol_window, lookback})``. Replaces the hardcoded ``warmup_periods=126``
+    constant that previously coupled call sites to the daily-cadence
+    default by hand; non-daily CSes need a different bar count (crypto
+    240, nasdaq100 520, us_firm 12).
+
+    Returns 0 when no allocator window is declared (the unbounded
+    fallback in ``load_backtest_prices_for`` will then skip the
+    prefix-day calculation entirely).
+    """
+    setup = _load_case_setup_yaml(case_study_id)
+    execution = setup.get("execution") or {}
+    candidates: list[int] = []
+    base = execution.get("allocator_lookback")
+    if base is not None:
+        candidates.append(int(base))
+    backtest = setup.get("backtest") or {}
+    sweep = backtest.get("sweep") or {}
+    allocators = sweep.get("allocators") or []
+    for alloc in allocators:
+        if not isinstance(alloc, dict):
+            continue
+        for key in ("vol_window", "lookback"):
+            value = alloc.get(key)
+            if value is not None:
+                candidates.append(int(value))
+    return max(candidates) if candidates else 0
+
+
+# Calendar-day spacing per allocator-window bar, indexed by setup.yaml
+# cadence / bar_frequency tokens. Daily cadences allow 1.5× to absorb
+# weekends + market holidays; intraday cadences are pure trading-time
+# (no weekend allowance needed — the price loader's start_date filter
+# only sees timestamps that exist). Monthly month-end approximates a
+# calendar-month spacing.
+_CADENCE_CALENDAR_DAYS_PER_PERIOD: dict[str, float] = {
+    # Daily cadences
+    "daily_close": 1.5,
+    "daily_ny_close": 1.5,
+    # Weekly cadences
+    "weekly_friday_close": 7.0,
+    "weekly_friday": 7.0,
+    # 8-hour funding
+    "8_hour_funding_aligned": 1.0 / 3.0,
+    # 8-hour decision grid on a 24/7 instrument, three slots a day and no weekend gap:
+    # exness_btc_8h, whose cadence token is `8_hour` because the CFD it trades has no
+    # funding settlements to align to. Added 2026-09-08; the token was not previously in
+    # this table and no other case study declares it, so no existing warmup window moves.
+    "8_hour": 1.0 / 3.0,
+    # Intraday equity microstructure: ~26 fifteen-minute bars per RTH
+    # trading day; multiply by 1.4 to account for weekends.
+    "15_minute": (1.0 / 26.0) * 1.4,
+    # Biweekly: every other ISO week, for labels whose horizon is ~10 sessions
+    "biweekly": 14.0,
+    "biweekly_friday_close": 14.0,
+    # Monthly month-end
+    "monthly_month_end": 31.0,
+}
+
+
+# Monday 1970-01-05, the first Monday at or after the Unix epoch, as a day number. The biweekly
+# schedule's parity is measured from here so it depends only on the calendar, never on which
+# window a caller happened to load.
+_BIWEEKLY_EPOCH_DAY = 4
+
+
+def _calendar_days_per_period(case_study_id: str, label: str | None = None) -> float:
+    """Calendar-day spacing per allocator-window bar for this case study and label.
+
+    Reads ``decision.entry_cadence`` (or ``decision.cadence`` or
+    ``decision.bar_frequency``), overridden per label by
+    ``decision.entry_cadence_by_label`` / ``decision.cadence_by_label``, and returns
+    the calendar-day multiplier used to walk the start_date back during a
+    warmup-prefix load. Falls back to the daily 1.5× heuristic when the cadence
+    token isn't recognized — old behavior for unknown CSes.
+
+    The label matters because the warmup prefix has to cover the allocator's lookback
+    in *its* bars: a label trading biweekly needs twice the calendar span of the same
+    lookback traded weekly, and under-reading the prefix silently shortens the window
+    the allocator fits on.
+    """
+    setup = _load_case_setup_yaml(case_study_id)
+    decision = setup.get("decision") or {}
+    cadence = (
+        decision.get("entry_cadence") or decision.get("cadence") or decision.get("bar_frequency")
+    )
+    if label:
+        by_label = decision.get("entry_cadence_by_label") or decision.get("cadence_by_label") or {}
+        cadence = by_label.get(label, cadence)
+    if cadence and cadence in _CADENCE_CALENDAR_DAYS_PER_PERIOD:
+        return _CADENCE_CALENDAR_DAYS_PER_PERIOD[cadence]
+    return 1.5
+
+
+def load_backtest_prices_for(
+    case_study_id: str,
+    label: str,
+    split: Literal["validation", "holdout"] = "validation",
+    warmup_periods: int = 0,
+    **kwargs,
+) -> pl.DataFrame:
+    """Load prices pre-windowed to ``canonical_window(case_study_id, label, split)``.
+
+    When ``warmup_periods > 0``, the start of the load window is left
+    unconstrained so rolling-vol allocators (``inverse_vol`` /
+    ``risk_parity`` / ``hrp`` / ``mvo_ledoit_wolf``) see pre-window history
+    and produce data-driven weights at the first rebalance instead of
+    falling back to the median-imputed warmup. The end of the window is
+    always capped to the canonical window end; the engine's port_ret only
+    covers rebalance timestamps from the predictions, so the extra prefix
+    history is consumed by the allocator's rolling window but does not
+    enter return aggregation.
+
+    Args:
+        case_study_id: Case study identifier.
+        label: Target label (e.g. ``"fwd_ret_21d"``).
+        split: ``"validation"`` (default) for the union-of-folds window, or
+            ``"holdout"`` for ``setup.yaml::evaluation.{holdout_start,
+            holdout_end}``.
+        warmup_periods: Number of pre-window periods the caller's allocator
+            needs (typically ``strategy.allocation.vol_window`` or
+            ``lookback``). When > 0, the start of the load window is
+            dropped so the parquet read returns the full prefix up to the
+            canonical window end. When 0 (default), only the canonical
+            window is loaded.
+        **kwargs: Forwarded to :func:`load_backtest_prices` (``max_symbols``,
+            ``frequency``, ``include_quotes``). Explicit ``start_date`` or
+            ``end_date`` in ``kwargs`` take precedence over the canonical
+            window.
+    """
+    import math
+    from datetime import timedelta
+
+    from case_studies.utils.cv_window import canonical_window
+
+    win = canonical_window(case_study_id, label, split=split)
+    if win is not None:
+        kwargs.setdefault("end_date", win[1].isoformat())
+        if warmup_periods <= 0:
+            kwargs.setdefault("start_date", win[0].isoformat())
+        else:
+            # Bounded warmup: walk start_date back by ~warmup_periods
+            # allocator-window bars, expressed as calendar days using the
+            # per-CS cadence multiplier from
+            # ``_CADENCE_CALENDAR_DAYS_PER_PERIOD``. Daily cadences use 1.5×
+            # (weekend + holiday allowance), weekly 7×, monthly 31×, 8h
+            # ~0.33×, 15-min ~0.054×. Previously this was a flat 1.5×
+            # which over-allocated by ~50× on the intraday
+            # nasdaq100_microstructure CS (520 periods × 15-min bars).
+            # ``math.ceil`` is load-bearing: float-arithmetic truncation
+            # (e.g. ``520 * (1.0/26.0) * 1.4`` can land at 27.999...)
+            # would silently under-provision the warmup window by one
+            # bar on intraday CSes. The floor of 7 days ensures the
+            # parquet read covers at least a full calendar week even
+            # when ``warmup_periods`` is tiny (e.g. monthly us_firm
+            # with 12 periods).
+            cal_per_period = _calendar_days_per_period(case_study_id, label)
+            prefix_days = max(math.ceil(warmup_periods * cal_per_period), 7)
+            kwargs.setdefault("start_date", (win[0] - timedelta(days=prefix_days)).isoformat())
+    return load_backtest_prices(case_study_id, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Calendar-aware schedule resolution
+# ---------------------------------------------------------------------------
+
+
+_CADENCE_UNIT_SECONDS = {
+    "min": 60,
+    "minute": 60,
+    "hour": 3600,
+    "h": 3600,
+}
+
+
+def _intraday_cadence_interval(cadence: str) -> timedelta | None:
+    """The interval a cadence token names, or None when it names no intraday interval.
+
+    Tokens are `<n>_<unit>` possibly with a trailing qualifier: `15_minute`, `4_hour`,
+    `8_hour_funding_aligned`. Anything that does not parse - `daily_close`,
+    `monthly_month_end` - is not an intraday cadence and is left to the callers above.
+    """
+    parts = cadence.split("_")
+    if len(parts) < 2 or not parts[0].isdigit():
+        return None
+    seconds = _CADENCE_UNIT_SECONDS.get(parts[1])
+    if seconds is None:
+        return None
+    return timedelta(seconds=int(parts[0]) * seconds)
+
+
+def _on_the_clock(ts: pl.Series, interval: timedelta) -> pl.Series:
+    """The timestamps whose time of day is a whole number of ``interval`` past midnight."""
+    seconds = int(interval.total_seconds())
+    return (
+        pl.DataFrame({"ts": ts})
+        .filter(
+            (
+                pl.col("ts").dt.hour().cast(pl.Int64) * 3600
+                + pl.col("ts").dt.minute().cast(pl.Int64) * 60
+                + pl.col("ts").dt.second().cast(pl.Int64)
+            )
+            % seconds
+            == 0
+        )
+        .get_column("ts")
+    )
+
+
+def resolve_rebalance_timestamps(
+    available_timestamps: pl.Series,
+    cadence: str,
+    calendar: str = "NYSE",
+) -> pl.Series:
+    """Resolve exact rebalance timestamps from cadence + calendar + available data.
+
+    Instead of counting elapsed seconds or stepping by fixed intervals, this
+    function selects the actual timestamps that match the declared schedule:
+
+    - ``monthly_month_end`` → last available timestamp in each calendar month
+    - ``weekly_friday_close`` / ``weekly_friday`` → last available timestamp
+      in each ISO week (typically Friday, or Thursday if Friday is a holiday)
+    - ``daily_*`` and coarser cadences naming no interval → every available timestamp
+    - ``8_hour_*`` / ``15_minute`` and every other fixed-interval cadence → the slots
+      on the clock at that interval, constructed rather than assumed. This line used
+      to say "every available timestamp ... already at the correct granularity",
+      which is the precondition nasdaq100_microstructure did not meet and
+      ml4t/agent-workspace#187 was filed about; the branch below has constructed the
+      schedule since public ``83141459`` and the description had not followed it.
+
+    Parameters
+    ----------
+    available_timestamps : pl.Series
+        Sorted unique timestamps from predictions or prices.
+    cadence : str
+        Rebalance cadence from setup.yaml.
+    calendar : str
+        Trading calendar name (used for future session filtering).
+
+    Returns
+    -------
+    pl.Series
+        Subset of available_timestamps matching the declared schedule.
+    """
+    if available_timestamps.is_empty():
+        return available_timestamps
+
+    ts = available_timestamps.unique().sort()
+
+    if cadence == "monthly_month_end":
+        # Last available session in each calendar month
+        df = pl.DataFrame({"ts": ts}).with_columns(
+            year=pl.col("ts").dt.year(),
+            month=pl.col("ts").dt.month(),
+        )
+        month_ends = (
+            df.group_by("year", "month").agg(pl.col("ts").max().alias("rebal_ts")).sort("rebal_ts")
+        )
+        return month_ends["rebal_ts"]
+
+    if cadence in {"weekly", "weekly_friday", "weekly_friday_close"}:
+        # Last available session in each ISO week
+        df = pl.DataFrame({"ts": ts}).with_columns(
+            iso_year=pl.col("ts").dt.iso_year(),
+            iso_week=pl.col("ts").dt.week(),
+        )
+        week_ends = (
+            df.group_by("iso_year", "iso_week")
+            .agg(pl.col("ts").max().alias("rebal_ts"))
+            .sort("rebal_ts")
+        )
+        return week_ends["rebal_ts"]
+
+    if cadence in {"biweekly", "biweekly_friday_close"}:
+        # Last available session of every other ISO week.
+        #
+        # The parity is taken on elapsed calendar weeks, not on position in the resolved list and
+        # not on `iso_year * 53 + iso_week`. Position would interleave: a caller loading a window
+        # that starts one week later would rebalance on exactly the weeks the other skipped, so
+        # the same strategy would register two schedules depending on how much history was read.
+        # The `* 53` counter is worse than it looks - most ISO years have 52 weeks, so it jumps by
+        # two at those boundaries and silently produces a 7-day or 21-day gap there.
+        #
+        # Weeks since a fixed Monday is continuous by construction and independent of the window.
+        df = pl.DataFrame({"ts": ts}).with_columns(
+            iso_year=pl.col("ts").dt.iso_year(),
+            iso_week=pl.col("ts").dt.week(),
+        )
+        week_ends = (
+            df.group_by("iso_year", "iso_week")
+            .agg(pl.col("ts").max().alias("rebal_ts"))
+            .with_columns(
+                # Monday of that timestamp's ISO week, as whole weeks since the epoch Monday.
+                elapsed_weeks=(
+                    pl.col("rebal_ts").cast(pl.Date).cast(pl.Int32)
+                    - (pl.col("rebal_ts").dt.weekday() - 1)
+                    - _BIWEEKLY_EPOCH_DAY
+                )
+                // 7
+            )
+            .filter(pl.col("elapsed_weeks") % 2 == 0)
+            .sort("rebal_ts")
+        )
+        return week_ends["rebal_ts"]
+
+    interval = _intraday_cadence_interval(cadence)
+    if interval is not None:
+        # Construct the schedule rather than assume the panel already is one.
+        #
+        # This branch used to return `ts` unchanged for every intraday cadence, on the
+        # comment "the data is already at the correct granularity". That is a precondition
+        # nothing checked, and nasdaq100_microstructure did not meet it: its prediction panel
+        # carries every minute, so a declared fifteen-minute cadence resolved to a decision
+        # every minute and the backtest traded fifteen times more often than the config said
+        # (ml4t/agent-workspace#187). Constructing the schedule makes the declaration
+        # decisive and makes a panel at any resolution produce the same schedule - which is
+        # what the Ch18 cadence sweep needs, since its arms differ only in this token.
+        #
+        # Anchored on the clock, not on the session's first row. That is the grid
+        # `03_financial_features.py` already calls the decision grid (`minute % 15 == 0`),
+        # and it is the one a reader can name: a fifteen-minute cadence decides on the
+        # quarter hour, every session, whatever time the panel happens to start at and
+        # however early the session closes. Anchoring on the first available row instead
+        # would put the decisions of a panel that starts at 10:31 - which this one does,
+        # after the warmup hour the features pay - at 10:31, 10:46, 11:01, agreeing with no
+        # other statement of the grid in the case study.
+        return _on_the_clock(ts, interval)
+
+    # Daily and coarser cadences that name no interval: every timestamp is a valid slot.
+    return ts
+
+
+# ---------------------------------------------------------------------------
+# Rebalance thinning
+# ---------------------------------------------------------------------------
+
+
+@cache
+def get_rebalance_step(case_study: str, label: str) -> int:
+    """Return the per-label vectorized-backtest thinning step, from setup.yaml.
+
+    The step is the number of schedule slots to advance per trade so that
+    holding periods don't overlap. It is a design-time property of the
+    (case study, label) pair — authored in each case study's
+    ``config/setup.yaml`` under ``labels.rebalance_step``. No inference
+    happens at runtime.
+
+    Parameters
+    ----------
+    case_study : str
+        Case study identifier (e.g., ``"sp500_options"``).
+    label : str
+        Label name (e.g., ``"ret_to_expiry"``).
+
+    Returns
+    -------
+    int
+        Rebalance step (>= 1).
+
+    Raises
+    ------
+    KeyError
+        If ``labels.rebalance_step[label]`` is missing from setup.yaml.
+        New labels must be registered explicitly.
+    """
+    # Always read the source-of-truth setup.yaml under CASE_STUDIES_DIR, not the
+    # ML4T_OUTPUT_DIR-redirected get_case_study_dir() path: the rebalance-step
+    # declaration is configuration, not output, and tests must see the real value.
+    from utils import CASE_STUDIES_DIR
+
+    setup_path = CASE_STUDIES_DIR / case_study / "config" / "setup.yaml"
+    setup = yaml.safe_load(setup_path.read_text())
+    steps = (setup.get("labels") or {}).get("rebalance_step") or {}
+    if label not in steps:
+        raise KeyError(
+            f"labels.rebalance_step[{label!r}] not declared in "
+            f"case_studies/{case_study}/config/setup.yaml. Add it explicitly — "
+            f"the step is (schedule cadence, label horizon)-dependent and must "
+            f"not be inferred at runtime."
+        )
+    step = int(steps[label])
+    if step < 1:
+        raise ValueError(
+            f"labels.rebalance_step[{label!r}] = {step!r} in "
+            f"case_studies/{case_study}/config/setup.yaml — must be >= 1."
+        )
+    return step
+
+
+def resolved_rebalance_step(rebalance_spec: dict | None, case_study: str, label: str) -> int:
+    """The step this run executes, taken from the spec when the spec records one.
+
+    `setup.yaml` is mutable and the spec is not. Reading the step from setup.yaml at
+    execution time lets a run hash one step and trade another - edit the file between the
+    hash and the run and nothing says so. The spec is the record of what was run, so it is
+    what execution reads; setup.yaml is the fallback for a spec written before the step
+    became part of the identity (ml4t/agent-workspace#1005).
+    """
+    if rebalance_spec and "step" in rebalance_spec:
+        step = int(rebalance_spec["step"])
+        if step < 1:
+            raise ValueError(f"strategy.rebalance.step must be >= 1, got {step}")
+        return step
+    return get_rebalance_step(case_study, label)
+
+
+def resolve_decision_schedule(
+    available_timestamps: pl.Series,
+    cadence: str,
+    step: int = 1,
+    calendar: str = "NYSE",
+) -> pl.Series:
+    """The timestamps a strategy decides on: the cadence, advanced by ``step`` slots.
+
+    The pair is what fixes the schedule, so it is resolved as a pair. On an intraday cadence
+    a step is folded into the interval - eight hours stepped by three is resolved as one
+    twenty-four-hour grid - rather than applied as `gather_every` over the resolved slots.
+    The two agree on a complete panel and disagree on a real one: `gather_every` counts rows,
+    so a venue outage that removes one slot shifts every decision after it to a different
+    time of day, permanently, and a session shorter than the rest does the same. Which
+    funding time a 24-hour strategy trades on is then a property of the gaps in the data
+    rather than of the strategy.
+
+    Daily and coarser cadences keep the row-counting form. A slot there is a session, which
+    is the unit the step is meant to count, and folding a step into a monthly interval is not
+    a duration in the first place.
+    """
+    if step < 1:
+        raise ValueError(f"rebalance step must be >= 1, got {step}")
+    interval = _intraday_cadence_interval(cadence)
+    if interval is not None:
+        return _on_the_clock(available_timestamps.unique().sort(), interval * step)
+    schedule = resolve_rebalance_timestamps(available_timestamps, cadence, calendar)
+    return schedule.gather_every(step) if step > 1 else schedule
+
+
+def declared_rebalance_step(case_study: str, label: str) -> int | None:
+    """The declared step for ``(case_study, label)``, or None when none is declared.
+
+    :func:`get_rebalance_step` raises for an undeclared label, which is right at the
+    point of use: a run must not infer a step. Spec construction needs the softer
+    question, because a case study that declares no step for a label is not in error -
+    it trades every scheduled slot - and its spec must stay byte-identical to what it
+    produced before the step became part of the identity.
+    """
+    try:
+        return get_rebalance_step(case_study, label)
+    except (KeyError, FileNotFoundError):
+        return None
+
+
+def thin_to_rebalance_dates(
+    predictions: pl.DataFrame,
+    cadence: str = "",
+    step: int = 1,
+    time_col: str = "timestamp",
+) -> pl.DataFrame:
+    """Thin predictions to non-overlapping rebalance dates.
+
+    Two-step thinning for vectorized backtests:
+
+    1. **Calendar alignment** — filter prediction timestamps to those that
+       match the declared rebalance cadence (e.g., only Fridays for
+       ``weekly_friday``, only month-ends for ``monthly_month_end``).
+    2. **Non-overlapping thinning** — keep every ``step``-th calendar-aligned
+       date so forward-return windows don't overlap. The caller supplies
+       ``step`` via :func:`get_rebalance_step`, which looks it up from
+       ``labels.rebalance_step`` in the case study's setup.yaml.
+
+    Parameters
+    ----------
+    predictions : pl.DataFrame
+        Must contain ``time_col`` (default ``"timestamp"``).
+    cadence : str
+        Rebalance cadence from setup.yaml (e.g., ``"monthly_month_end"``).
+    step : int
+        Number of schedule slots to advance per trade (1 = keep every
+        calendar-aligned date). Must be >= 1.
+    time_col : str
+        Timestamp column name.
+
+    Returns
+    -------
+    pl.DataFrame
+        Filtered DataFrame with rows at non-overlapping rebalance times.
+    """
+    all_dates = predictions[time_col].unique().sort()
+    n_dates = len(all_dates)
+    if n_dates <= 1:
+        return predictions
+
+    # The cadence and the step fix the schedule together, so they resolve together.
+    schedule_dates = resolve_decision_schedule(all_dates, cadence, step)
+
+    # Semi-join to filter — avoids Polars is_in precision mismatch
+    # (group_by().agg(max) can change Datetime precision)
+    schedule_df = pl.DataFrame({time_col: schedule_dates})
+    if schedule_df[time_col].dtype != predictions[time_col].dtype:
+        schedule_df = schedule_df.cast({time_col: predictions[time_col].dtype})
+    return predictions.join(schedule_df, on=time_col, how="semi")
+
+
+# ---------------------------------------------------------------------------
+# Shared allocator metrics
+# ---------------------------------------------------------------------------
+
+
+def _periods_per_year_from_ann_factor(ann_factor: float) -> int:
+    """Convert annualization factor (sqrt(N)) back to periods per year."""
+    return max(1, round(ann_factor**2))
+
+
+def target_weight_turnover(
+    weights: pl.DataFrame,
+    *,
+    time_col: str = "timestamp",
+    asset_col: str = "symbol",
+    weight_col: str = "weight",
+    transition_col: str = "_state_transition",
+) -> pl.DataFrame:
+    """Per-rebalance turnover ``sum_i |w_i(t) - w_i(t-1)|`` under target-weight semantics.
+
+    The weight frames the signal builders and allocators produce hold only the names that are
+    held (``_signals_to_equal_weights`` drops zero weights), so a per-symbol ``shift(1)`` on that
+    frame compares a name with its own previous *held* row, not with its weight at the previous
+    rebalance. A top-1 book rotating through N names then registers one ``|w|`` per name over the
+    whole run and ``avg_turnover`` collapses to ``N / n_periods`` (exness_fx_d1: 5 / 1,031 = 0.0048
+    on every one of 1,068 rows, the same value on a book that changed on 692 sessions). The frame
+    is therefore densified over (every timestamp that carries a target) x (every name that ever
+    appears), missing cells are 0.0, and the difference is taken on that grid.
+
+    A timestamp flagged in ``transition_col`` (``research.strategy.apply_state_transition_policy``:
+    fold boundary or temporal gap, executed as flatten-then-re-enter) pays
+    ``sum_i |w_i(t-1)| + sum_i |w_i(t)|`` on that timestamp, the round trip the engine books.
+
+    Returns one row per distinct timestamp of ``weights`` with columns ``[time_col, "turnover"]``,
+    sorted by time. A ``(time_col, asset_col)`` duplicate is refused, as it is by the engine.
+    """
+    if weights.height == 0:
+        return pl.DataFrame(
+            schema={time_col: weights.schema.get(time_col, pl.Datetime), "turnover": pl.Float64}
+        )
+    duplicates = weights.select(pl.struct(time_col, asset_col).is_duplicated().sum()).item()
+    if duplicates:
+        raise ValueError(f"Target weights contain {duplicates} duplicate timestamp-symbol rows")
+    timestamps = weights.select(time_col).unique().sort(time_col)
+    symbols = weights.select(asset_col).unique().sort(asset_col)
+    dense = (
+        timestamps.join(symbols, how="cross")
+        .join(
+            weights.select(time_col, asset_col, pl.col(weight_col).cast(pl.Float64)),
+            on=[time_col, asset_col],
+            how="left",
+        )
+        .with_columns(pl.col(weight_col).fill_null(0.0))
+        .sort(asset_col, time_col)
+        .with_columns(prev=pl.col(weight_col).shift(1).over(asset_col).fill_null(0.0))
+    )
+    per_timestamp = (
+        dense.with_columns(
+            abs_change=(pl.col(weight_col) - pl.col("prev")).abs(),
+            round_trip=pl.col("prev").abs() + pl.col(weight_col).abs(),
+        )
+        .group_by(time_col)
+        .agg(turnover=pl.col("abs_change").sum(), _round_trip=pl.col("round_trip").sum())
+    )
+    if transition_col in weights.columns:
+        transition_timestamps = (
+            weights.filter(pl.col(transition_col).fill_null(False)).get_column(time_col).unique()
+        )
+        per_timestamp = per_timestamp.with_columns(
+            turnover=pl.when(pl.col(time_col).is_in(transition_timestamps.implode()))
+            .then(pl.col("_round_trip"))
+            .otherwise(pl.col("turnover"))
+        )
+    return per_timestamp.select(time_col, "turnover").sort(time_col)
+
+
+def compute_allocator_metrics(
+    port_returns: pl.Series | list[float],
+    weights_df: pl.DataFrame | None = None,
+    ann_factor: float = np.sqrt(252),
+    time_col: str = "timestamp",
+    cost_rate: float = 0.0,
+) -> dict:
+    """Compute allocator summary metrics using ml4t-diagnostic PortfolioAnalysis.
+
+    Args:
+        port_returns: Series or list of per-period gross returns. If cost_rate > 0,
+            turnover-adjusted net returns are computed internally.
+        weights_df: Optional DataFrame with [timestamp, symbol, weight] for
+            computing concentration and turnover metrics.
+        ann_factor: Annualization factor (sqrt of periods per year).
+        time_col: Time column name in weights_df.
+        cost_rate: Per-period cost rate applied to turnover (e.g., 0.001 for 10 bps).
+            When > 0, net returns = gross - turnover * cost_rate.
+
+    Returns:
+        Dict with return-based metrics from PortfolioAnalysis plus weight-based
+        metrics (turnover, HHI, effective bets, max weight).
+    """
+    import numpy as _np
+    from ml4t.diagnostic.evaluation import PortfolioAnalysis
+
+    if isinstance(port_returns, pl.Series):
+        rets = port_returns.to_numpy()
+    else:
+        rets = _np.array(port_returns)
+
+    rets = rets[~_np.isnan(rets)]
+    _empty_keys = [
+        "sharpe",
+        "sortino",
+        "calmar",
+        "omega",
+        "total_return",
+        "annual_return",
+        "max_drawdown",
+        "max_dd_duration",
+        "var_95",
+        "cvar_95",
+        "win_rate",
+        "profit_factor",
+        "stability",
+        "avg_turnover",
+        "avg_hhi",
+        "eff_bets",
+        "avg_max_weight",
+    ]
+    if len(rets) == 0:
+        return {k: 0.0 for k in _empty_keys}
+
+    # --- Weight-based metrics (computed first for cost deduction) ---
+    avg_turnover = 0.0
+    avg_hhi = 0.0
+    eff_bets = 0.0
+    avg_max_weight = 0.0
+    turnover_per_period = None
+
+    if weights_df is not None and len(weights_df) > 0:
+        hhi_ts = (
+            weights_df.with_columns(w2=pl.col("weight") ** 2)
+            .group_by(time_col)
+            .agg(hhi=pl.col("w2").sum(), max_w=pl.col("weight").abs().max())
+        )
+        avg_hhi = float(hhi_ts["hhi"].mean())
+        avg_max_weight = float(hhi_ts["max_w"].mean())
+        eff_bets = 1.0 / avg_hhi if avg_hhi > 0 else 0.0
+
+        # Densified over (timestamp x symbol) so a name that leaves the book pays its exit;
+        # see `target_weight_turnover`. Sorted by time, so the positional pairing with `rets`
+        # below is the chronological one.
+        to_ts = target_weight_turnover(weights_df, time_col=time_col)
+        avg_turnover = float(to_ts["turnover"].mean())
+        if cost_rate > 0:
+            turnover_per_period = to_ts["turnover"].to_numpy()
+
+    # Deduct transaction costs if cost_rate provided
+    if cost_rate > 0 and turnover_per_period is not None:
+        n = min(len(rets), len(turnover_per_period))
+        rets = rets[:n] - turnover_per_period[:n] * cost_rate
+    elif cost_rate > 0:
+        rets = rets - avg_turnover * cost_rate
+
+    # --- Return-based metrics via PortfolioAnalysis ---
+    periods_per_year = _periods_per_year_from_ann_factor(ann_factor)
+    pa = PortfolioAnalysis(pl.Series("returns", rets), periods_per_year=periods_per_year)
+    stats = pa.compute_summary_stats()
+    dd = pa.compute_drawdown_analysis()
+
+    def _safe_round(value: object, digits: int = 4) -> float:
+        if isinstance(value, complex):
+            value = value.real
+        return round(float(value), digits)
+
+    return {
+        "sharpe": _safe_round(stats.sharpe_ratio, 4),
+        "sortino": _safe_round(stats.sortino_ratio, 4),
+        "calmar": _safe_round(stats.calmar_ratio, 4),
+        "omega": _safe_round(stats.omega_ratio, 4),
+        "total_return": _safe_round(stats.total_return, 6),
+        "annual_return": _safe_round(stats.annual_return, 6),
+        "max_drawdown": _safe_round(stats.max_drawdown, 6),
+        "max_dd_duration": int(dd.max_duration_days),
+        "var_95": _safe_round(stats.var_95, 6),
+        "cvar_95": _safe_round(stats.cvar_95, 6),
+        "win_rate": _safe_round(stats.win_rate, 4),
+        "profit_factor": _safe_round(stats.profit_factor, 4),
+        "stability": _safe_round(stats.stability, 4),
+        "avg_turnover": round(avg_turnover, 6),
+        "avg_hhi": round(avg_hhi, 6),
+        "eff_bets": round(eff_bets, 2),
+        "avg_max_weight": round(avg_max_weight, 6),
+    }
+
+
+def compute_dsr_table(
+    returns_by_source: dict[str, pl.Series | np.ndarray],
+    periods_per_year: int = 252,
+) -> pl.DataFrame:
+    """Rank model variants by Sharpe with raw-K selection-bias adjustment for the best.
+
+    Ad-hoc utility for one-off DSR analysis over a custom returns dict. Uses
+    **raw-K** trial counting (no Marchenko-Pastur or effective-rank
+    correction), which overcounts trials when variants are correlated.
+
+    For headline / persisted DSR numbers, prefer the cohort_metrics table:
+
+        BacktestExplorer(cs).deflated_sharpe(stage="signal")
+
+    which surfaces the effective-rank (ER) DSR — the library maintainer's
+    recommended default — alongside MP and raw-K for sensitivity.
+
+    Each variant gets its own Sharpe ratio and individual PSR (probability of
+    skill without multiple-testing correction). The best variant additionally
+    gets DSR columns showing how selection bias across K tested strategies
+    deflates the observed Sharpe.
+
+    Args:
+        returns_by_source: Dict mapping model name to return series.
+        periods_per_year: Annualization periods.
+
+    Returns:
+        DataFrame sorted by Sharpe (descending) with columns: source, sharpe,
+        psr_pvalue, deflated_sharpe, expected_max_sharpe, dsr_pvalue,
+        significant, is_best.
+    """
+    from ml4t.diagnostic.evaluation.stats import deflated_sharpe_ratio
+
+    freq_map = {252: "daily", 52: "weekly", 12: "monthly", 1: "annual"}
+    frequency = freq_map.get(periods_per_year, "daily")
+
+    all_returns = []
+    names = []
+    for name, ret in returns_by_source.items():
+        arr = ret.to_numpy() if isinstance(ret, pl.Series) else np.asarray(ret)
+        all_returns.append(arr)
+        names.append(name)
+
+    if not all_returns:
+        return pl.DataFrame(
+            schema={
+                "source": pl.Utf8,
+                "sharpe": pl.Float64,
+                "psr_pvalue": pl.Float64,
+                "deflated_sharpe": pl.Float64,
+                "expected_max_sharpe": pl.Float64,
+                "dsr_pvalue": pl.Float64,
+                "significant": pl.Boolean,
+                "is_best": pl.Boolean,
+            }
+        )
+
+    # Per-variant PSR (individual probability of skill, no multiple-testing correction)
+    per_variant_psr = {}
+    sharpes = {}
+    for i, name in enumerate(names):
+        arr = all_returns[i]
+        sr = float(np.mean(arr) / max(np.std(arr, ddof=1), 1e-8) * np.sqrt(periods_per_year))
+        sharpes[name] = sr
+        try:
+            psr = deflated_sharpe_ratio(
+                [arr], frequency=frequency, periods_per_year=periods_per_year
+            )
+            per_variant_psr[name] = psr
+        except Exception as exc:
+            warnings.warn(f"DSR computation failed for {name}: {exc}", stacklevel=2)
+            per_variant_psr[name] = None
+
+    # Aggregate DSR across all variants (selection-bias adjustment for best-of-K)
+    # Filter out zero-variance return series (e.g. constant/all-zero returns from test data)
+    valid_returns = [r for r in all_returns if np.std(r, ddof=1) > 1e-10]
+    if not valid_returns:
+        return pl.DataFrame(
+            schema={
+                "source": pl.Utf8,
+                "sharpe": pl.Float64,
+                "psr_pvalue": pl.Float64,
+                "deflated_sharpe": pl.Float64,
+                "expected_max_sharpe": pl.Float64,
+                "dsr_pvalue": pl.Float64,
+                "significant": pl.Boolean,
+                "is_best": pl.Boolean,
+            }
+        )
+    dsr = deflated_sharpe_ratio(
+        valid_returns, frequency=frequency, periods_per_year=periods_per_year
+    )
+
+    # Identify best variant by Sharpe
+    best_name = max(sharpes, key=sharpes.get)
+
+    rows = []
+    for name in names:
+        psr = per_variant_psr.get(name)
+        is_best = name == best_name
+        rows.append(
+            {
+                "source": name,
+                "sharpe": round(sharpes[name], 4),
+                "psr_pvalue": round(psr.p_value, 4) if psr else None,
+                "deflated_sharpe": round(dsr.deflated_sharpe, 4) if is_best else None,
+                "expected_max_sharpe": round(dsr.expected_max_sharpe, 4) if is_best else None,
+                "dsr_pvalue": round(dsr.p_value, 4) if is_best else None,
+                "significant": bool(dsr.is_significant) if is_best else None,
+                "is_best": is_best,
+            }
+        )
+
+    # Sort by Sharpe descending so best is row 0
+    df = pl.DataFrame(rows).sort("sharpe", descending=True)
+    return df
+
+
+def print_stage_dsr_summary(
+    explorer,
+    *,
+    stages: tuple[str, ...] = ("signal", "allocation", "cost_sensitivity", "risk_overlay"),
+    top_n: int = 20,
+    head: int = 10,
+    prediction_hashes: tuple[str, ...] | list[str] | None = None,
+) -> None:
+    """Print per-stage DSR / PSR tables for a case-study explorer.
+
+    The selection-bias question — "after K variants were tried, does the leader
+    have skill?" — is well-defined at every pipeline stage, not just the
+    equal-weight baseline. This helper iterates the four stages, prints the leader
+    table for each one (with PSR per variant + DSR for the leader), and
+    silently skips stages that have no data.
+    """
+    for stage in stages:
+        display_stage = "equal-weight baseline" if stage == "signal" else stage
+        try:
+            table = explorer.deflated_sharpe(
+                stage=stage, top_n=top_n, prediction_hashes=prediction_hashes
+            )
+        except ValueError as exc:
+            if "zero variance" in str(exc).lower():
+                print(f"\n--- DSR @ {display_stage}: skipped ({exc}) ---")
+                continue
+            raise
+        except Exception as exc:  # pragma: no cover
+            print(f"\n--- DSR @ {display_stage}: error ({exc}) ---")
+            continue
+        if table is None or table.is_empty():
+            continue
+        print(f"\n--- DSR @ {display_stage} (K={table.height}) ---")
+        print(table.head(head))
+
+
+def infer_session_alignment(calendar: str | None) -> bool:
+    """Infer whether returns should be aligned to trading sessions."""
+    return bool(calendar and "CME" in str(calendar).upper())
+
+
+def _extract_session_aligned_returns(result: BacktestResult) -> pl.DataFrame:
+    """Rebuild session-aligned returns when ml4t-backtest's helper hits dtype issues."""
+    from zoneinfo import ZoneInfo
+
+    from ml4t.backtest.sessions import SessionConfig, assign_session_date
+
+    equity_df = (
+        result.to_equity_dataframe()
+        .select("timestamp", "equity")
+        .with_columns(pl.col("equity").cast(pl.Float64))
+    )
+    if equity_df.is_empty():
+        return pl.DataFrame({"timestamp": pl.Series([], dtype=pl.Date), "daily_return": []})
+
+    session_config = SessionConfig(
+        calendar=result.config.calendar,
+        timezone=result.config.timezone,
+        session_start_time=getattr(result.config, "session_start_time", None),
+    )
+    tz = ZoneInfo(session_config.timezone)
+    session_start_hour = session_config.get_session_start_hour()
+    session_start_minute = session_config.get_session_start_minute()
+    timestamps = equity_df["timestamp"].to_list()
+    session_dates = [
+        assign_session_date(ts, tz, session_start_hour, session_start_minute) for ts in timestamps
+    ]
+
+    daily = (
+        pl.DataFrame(
+            {
+                "timestamp": timestamps,
+                "equity": equity_df["equity"].to_list(),
+                "session_date": session_dates,
+            },
+            strict=False,
+        )
+        .group_by("session_date")
+        .agg(
+            pl.col("equity").first().alias("open_equity"),
+            pl.col("equity").last().alias("close_equity"),
+        )
+        .sort("session_date")
+    )
+
+    prev_close = daily.select(pl.col("close_equity").shift(1)).to_series()
+    return (
+        daily.with_columns(
+            ((pl.col("close_equity") - prev_close) / prev_close)
+            .fill_null(0.0)
+            .alias("daily_return")
+        )
+        .select(pl.col("session_date").cast(pl.Date).alias("timestamp"), "daily_return")
+        .sort("timestamp")
+        .unique("timestamp", keep="last")
+    )
+
+
+def extract_daily_returns_frame(
+    result: BacktestResult,
+    calendar: str | None = None,
+    session_aligned: bool | None = None,
+) -> pl.DataFrame:
+    """Extract daily returns with dates from BacktestResult.
+
+    Prefers `to_daily_pnl()` so output includes date/session_date labels.
+    """
+    if session_aligned is None:
+        cal = calendar
+        if cal is None and hasattr(result, "config") and result.config is not None:
+            cal = getattr(result.config, "calendar", None)
+        session_aligned = infer_session_alignment(cal)
+
+    if hasattr(result, "to_daily_pnl"):
+        try:
+            daily = result.to_daily_pnl(session_aligned=session_aligned)
+        except TypeError:
+            if session_aligned and getattr(result, "config", None) is not None:
+                return _extract_session_aligned_returns(result)
+            daily = None
+        if daily is not None:
+            if daily.is_empty():
+                return pl.DataFrame({"timestamp": pl.Series([], dtype=pl.Date), "daily_return": []})
+            date_col = "session_date" if "session_date" in daily.columns else "date"
+            if date_col not in daily.columns:
+                msg = f"to_daily_pnl() missing date column. Columns: {daily.columns}"
+                raise ValueError(msg)
+            return (
+                daily.select(
+                    pl.col(date_col).cast(pl.Date).alias("timestamp"),
+                    pl.col("return_pct").cast(pl.Float64).alias("daily_return"),
+                )
+                .sort("timestamp")
+                .unique("timestamp", keep="last")
+            )
+
+    if hasattr(result, "to_daily_returns"):
+        daily_returns = result.to_daily_returns(
+            calendar=calendar,
+            session_aligned=session_aligned,
+        )
+        if not isinstance(daily_returns, pl.Series):
+            daily_returns = pl.Series("daily_return", np.asarray(daily_returns, dtype=float))
+        return pl.DataFrame(
+            {"date_idx": np.arange(len(daily_returns)), "daily_return": daily_returns}
+        )
+
+    if hasattr(result, "to_returns_series"):
+        rets = result.to_returns_series()
+        if not isinstance(rets, pl.Series):
+            rets = pl.Series("daily_return", np.asarray(rets, dtype=float))
+        return pl.DataFrame({"date_idx": np.arange(len(rets)), "daily_return": rets})
+
+    msg = "BacktestResult has no daily or period returns export method"
+    raise AttributeError(msg)
+
+
+def aggregate_timestamped_returns_to_daily(
+    returns_df: pl.DataFrame,
+    *,
+    timestamp_col: str = "timestamp",
+    return_col: str = "ret",
+    calendar: str | None = None,
+    session_aligned: bool | None = None,
+) -> pl.DataFrame:
+    """Aggregate timestamped period returns to daily returns.
+
+    For CME-style sessions, uses session-date assignment when available.
+    """
+    if returns_df.is_empty():
+        return pl.DataFrame({"timestamp": pl.Series([], dtype=pl.Date), "daily_return": []})
+
+    if timestamp_col not in returns_df.columns or return_col not in returns_df.columns:
+        msg = f"Expected columns '{timestamp_col}' and '{return_col}'. Got: {returns_df.columns}"
+        raise ValueError(msg)
+
+    out = returns_df.select([timestamp_col, return_col]).drop_nulls()
+    if out.is_empty():
+        return pl.DataFrame({"timestamp": pl.Series([], dtype=pl.Date), "daily_return": []})
+
+    if out[timestamp_col].dtype == pl.Utf8:
+        out = out.with_columns(pl.col(timestamp_col).str.to_datetime(strict=False))
+
+    if session_aligned is None:
+        session_aligned = infer_session_alignment(calendar)
+
+    if session_aligned:
+        try:
+            from zoneinfo import ZoneInfo
+
+            from ml4t.backtest.sessions import SessionConfig, assign_session_date
+
+            cfg = SessionConfig(calendar=str(calendar or "CME_Equity"))
+            tz = ZoneInfo(cfg.timezone)
+            sh = cfg.get_session_start_hour()
+            sm = cfg.get_session_start_minute()
+            ts = out[timestamp_col].to_list()
+            session_dates = [assign_session_date(t, tz, sh, sm).date() for t in ts]
+            out = out.with_columns(pl.Series("timestamp", session_dates, dtype=pl.Date))
+        except Exception:
+            out = out.with_columns(pl.col(timestamp_col).dt.date().alias("timestamp"))
+    else:
+        out = out.with_columns(pl.col(timestamp_col).dt.date().alias("timestamp"))
+
+    return (
+        out.group_by("timestamp")
+        .agg(daily_return=((1.0 + pl.col(return_col)).product() - 1.0))
+        .sort("timestamp")
+    )
+
+
+# ---------------------------------------------------------------------------
+# Config extraction
+# ---------------------------------------------------------------------------
+
+
+def get_backtest_config(case_study_id: str) -> BacktestConfig:
+    """Extract backtesting configuration from setup.yaml.
+
+    Normalizes the heterogeneous costs sections into a uniform
+    (commission_bps, slippage_bps) pair.
+
+    Args:
+        case_study_id: Case study identifier
+
+    Returns:
+        BacktestConfig with normalized cost and execution parameters
+    """
+    case_dir = get_case_study_dir(case_study_id)
+    setup = yaml.safe_load((case_dir / "config" / "setup.yaml").read_text())
+    market_semantics = resolve_market_semantics(case_study_id, setup)
+
+    labels = setup["labels"]
+    evaluation = setup["evaluation"]
+    decision = setup.get("decision", {})
+    mapping = setup.get("mapping", {})
+    costs = setup.get("costs", {})
+
+    # Normalize costs to (commission_bps, slippage_bps)
+    commission_bps, slippage_bps = _normalize_costs(costs, case_study_id)
+
+    # Determine long/short from mapping state-space tokens.
+    # One-sided short states (e.g., short_straddle_hedged) should not trigger cross-sectional
+    # long/short construction.
+    position_space = str(mapping.get("position_state_space", "long_only")).strip().lower()
+    tokens = [tok for tok in re.split(r"[^a-z0-9]+", position_space) if tok]
+    long_short = "long" in tokens and "short" in tokens
+
+    # Determine cadence: entry_cadence > cadence > bar_frequency > default
+    cadence = (
+        decision.get("entry_cadence")
+        or decision.get("cadence")
+        or decision.get("bar_frequency")
+        or "monthly_month_end"
+    )
+
+    backtest_block = setup.get("backtest", {}) or {}
+    rebalance_block = backtest_block.get("rebalance", {}) or {}
+    default_rebal = rebalance_block.get("default", {}) or {}
+
+    # Engine-level execution defaults: single source of truth. Notebooks must
+    # never declare local INITIAL_CASH / SHARE_TYPE constants. Falls back to
+    # the previous notebook defaults during migration; the CS's setup.yaml
+    # should declare an ``execution:`` block explicitly.
+    execution = setup.get("execution", {}) or {}
+    initial_cash = float(execution.get("initial_cash", 100_000.0))
+    share_type = str(execution.get("share_type", "integer"))
+
+    # Per-label overrides. `entry_cadence_by_label` mirrors the `entry_cadence > cadence`
+    # precedence above; a label absent from both trades on the case-study default.
+    cadence_by_label = {
+        str(k): str(v)
+        for k, v in (
+            decision.get("entry_cadence_by_label") or decision.get("cadence_by_label") or {}
+        ).items()
+    }
+    _declared = set(labels.get("variants") or []) | {labels["primary"]}
+    _unknown = sorted(set(cadence_by_label) - _declared)
+    if _unknown:
+        raise ValueError(
+            f"decision.cadence_by_label names {_unknown} which are not declared in labels "
+            f"for {case_study_id}; known labels: {sorted(_declared)}"
+        )
+
+    return BacktestConfig(
+        case_study_id=case_study_id,
+        primary_label=labels["primary"],
+        label_buffer=labels.get("buffer", ""),
+        calendar=market_semantics.get("calendar") or evaluation.get("calendar", "NYSE"),
+        cadence=cadence,
+        execution_delay=decision.get("execution_delay", "next_bar_open"),
+        commission_bps=commission_bps,
+        slippage_bps=slippage_bps,
+        costs_class=costs.get("class", "material"),
+        long_short=long_short,
+        holdout_start=evaluation.get("holdout_start", ""),
+        holdout_end=evaluation.get("holdout_end", ""),
+        n_splits=evaluation.get("n_splits", 1),
+        raw_costs=costs,
+        min_weight_change=float(default_rebal.get("min_weight_change", 0.005)),
+        min_trade_value=float(default_rebal.get("min_trade_value", 100.0)),
+        initial_cash=initial_cash,
+        share_type=share_type,
+        cadence_by_label=cadence_by_label,
+    )
+
+
+def read_mt5_lot_sizing_declaration(case_study_id: str) -> dict | None:
+    """Read the ``mt5_lot`` sizing declaration (``sizing.min_lot_policy`` +
+    ``costs.contract.{volume_min,volume_step,volume_max,account_currency_is_base_for}`` +
+    ``costs.account_currency``) from the case study's own ``setup.yaml``.
+
+    Returns ``None`` when the case study has not opted in (``execution.share_type`` is not
+    ``"mt5_lot"``, or ``sizing.min_lot_policy`` is absent) -- every case study shipped before
+    generation 3 of ``exness_fx_d1``, including ``xau_fx_mt5``'s own ``integer`` declaration.
+
+    Single source of truth shared by two consumers that must never drift apart on what
+    "declared" means: ``backtest_runner.py::_apply_lot_floor_if_declared`` (applies the
+    declaration to the weights) and ``backtest_presets.py::build_resolved_backtest_config``
+    (records the declaration in the resolved ``backtest_config.metadata``, which -- via
+    ``ensure_backtest_spec``'s metadata plumbing -- is part of the hashed ``strategy_spec``;
+    mentor fleet gate, 2026-09-10, item B: before this, toggling ``sizing.min_lot_policy`` alone
+    did not move ``backtest_hash``, a silent identity gap declared and closed in
+    ``bots/exness_fx_d1/GEN3_DECLARATION_2026-09-10.md``).
+    """
+    setup_path = get_case_study_dir(case_study_id, create=False) / "config" / "setup.yaml"
+    if not setup_path.exists():
+        return None
+    setup = yaml.safe_load(setup_path.read_text(encoding="utf-8")) or {}
+    if str((setup.get("execution") or {}).get("share_type", "")) != "mt5_lot":
+        return None
+    sizing = setup.get("sizing") or {}
+    min_lot_policy = sizing.get("min_lot_policy")
+    if not min_lot_policy:
+        return None
+    costs = setup.get("costs") or {}
+    return {
+        "min_lot_policy": min_lot_policy,
+        "contract": costs.get("contract") or {},
+        "account_currency": costs.get("account_currency"),
+    }
+
+
+def get_benchmark_rebalance_thresholds(case_study_id: str) -> tuple[float, float]:
+    """Return (min_weight_change, min_trade_value) for the benchmark profile.
+
+    Read from setup.yaml:backtest.rebalance.benchmark. The benchmark — full-
+    universe equal-weight — needs thresholds disabled (per-asset weight = 1/N
+    is below the default 0.5% for any reasonable universe), so this profile
+    typically returns (0.0, 0.0). Falls back to the default profile if no
+    benchmark block is declared.
+    """
+    case_dir = get_case_study_dir(case_study_id)
+    setup = yaml.safe_load((case_dir / "config" / "setup.yaml").read_text())
+    rebal = (setup.get("backtest", {}) or {}).get("rebalance", {}) or {}
+    bench = rebal.get("benchmark") or rebal.get("default") or {}
+    return (
+        float(bench.get("min_weight_change", 0.0)),
+        float(bench.get("min_trade_value", 0.0)),
+    )
+
+
+def _normalize_costs(costs: dict, case_study_id: str) -> tuple[float, float]:
+    """Convert heterogeneous cost structures to (commission_bps, slippage_bps).
+
+    Returns:
+        (commission_bps, slippage_bps) — both in basis points
+    """
+    if not costs or costs.get("class") == "negligible":
+        return 0.0, 0.0
+
+    # Most case studies: per_leg_cost_bps_range → midpoint
+    if "per_leg_cost_bps_range" in costs:
+        lo, hi = costs["per_leg_cost_bps_range"]
+        midpoint = (lo + hi) / 2
+        # Split roughly 60/40 between commission and slippage
+        return midpoint * 0.6, midpoint * 0.4
+
+    # Crypto: fee_schedule with taker/maker
+    if "fee_schedule" in costs:
+        fee = costs["fee_schedule"]
+        taker = fee.get("taker_bps", 4)
+        maker = fee.get("maker_bps", 2)
+        # Use taker as conservative estimate (most retail trades are taker)
+        return float(taker), 1.0  # Minimal slippage for liquid crypto
+
+    # Round trip cost
+    if "round_trip_cost_bps" in costs:
+        rt = costs["round_trip_cost_bps"]
+        per_leg = rt / 2
+        return per_leg * 0.6, per_leg * 0.4
+
+    # CFD account block (bots: mt5-exness-broker.md section 2): ``spread_bps`` by pair class,
+    # ``commission_per_lot`` and ``swap``. The spread is charged at the top of the declared
+    # range for the pair classes the universe holds - the same rule
+    # ``01_feasibility_analysis`` prices a round trip with (``2 * spread_bps[class][-1]``) -
+    # as the slippage leg of the percentage model. The swap is a holding cost per night, not
+    # a per-crossing cost the engine can express, so it is left to the cost stage. Keyed on
+    # ``commission_per_lot`` so the template ``fx_pairs`` block (spread only) keeps the
+    # fallback below and its registered identities.
+    if "commission_per_lot" in costs and isinstance(costs.get("spread_bps"), dict):
+        return _normalize_cfd_costs(costs, case_study_id)
+
+    # Fallback: covers cme_futures (commission_per_contract + spread_ticks)
+    # and other non-standard cost structures. For CME futures, exact bps
+    # conversion requires contract-specific notional; 7 bps total is a
+    # reasonable aggregate across the 30-product universe.
+    return 5.0, 2.0
+
+
+# Metal CFDs quoted against the dollar. They are checked BEFORE the "USD" test below, because
+# XAUUSD and XAGUSD both contain "USD" and would otherwise be priced with the FX majors' spread -
+# in silence, and wrongly by a factor of about four on silver, whose measured p90 on the Exness
+# Pro account is 4.70 bps against 0.6-1.3 bps for the FX pairs (bots/assets/XAGUSD.md section 12b).
+# The prefix, not a substring: XAUUSD247m (24/7 gold) and any future XAU cross still resolve here,
+# while EURUSD does not.
+_METAL_PREFIXES = ("XAU", "XAG", "XPT", "XPD")
+
+# Crypto CFDs quoted against the dollar, checked BEFORE the "USD" test for exactly the same
+# reason as the metals above and one added 2026-09-08 by exness_btc_8h: BTCUSD contains "USD",
+# so without this branch it resolves to `major_pairs` and a crypto universe is priced with the
+# FX majors' 0.6-1.3 bps - in silence, and wrongly by a factor of about thirteen against the
+# in-sample p90 of 17.6 bps measured on this account (case_studies/exness_btc_8h/config/
+# setup.yaml::costs.spread_bps_in_sample). Prefixes, not substrings, so a suffixed Market Watch
+# name and any future BTC cross still resolve here while no FX pair or metal does.
+_CRYPTO_PREFIXES = ("BTC", "XBT", "ETH", "LTC", "BCH", "XRP", "SOL", "ADA", "DOGE", "DOT")
+
+# Index CFDs, checked before the "USD" test for the same reason and one added 2026-09-08 by
+# exness_usidx_sess. NEITHER `US500` NOR `USTEC` CONTAINS "USD", so without this branch they
+# resolve to `cross_pairs` and an index universe is priced at the FX crosses' 3-8 bps - in
+# silence, and wrongly by a factor of about ten against the p90 of 0.66 / 0.39 bps measured on
+# this account. Membership is EXACT, not by prefix: `US500` is a member and nothing else can be
+# captured by accident, so fx_pairs, exness_fx_d1, exness_gold_sess and exness_btc_8h keep the
+# classes - and therefore the registered identities - they had.
+_INDEX_SYMBOLS = frozenset(
+    {"US500", "USTEC", "US30", "DE40", "UK100", "JP225", "FR40", "AUS200", "HK50", "STOXX50"}
+)
+
+
+def _cfd_pair_class(symbol: str) -> str:
+    """``crypto`` / ``metals`` / ``indices`` for those CFDs, ``major_pairs`` for a dollar pair, else ``cross_pairs``.
+
+    The metals branch is what lets a metals-only universe declare ``spread_bps: {metals: [...]}``
+    without also declaring an FX range it does not trade, and the indices branch does the same
+    for ``exness_usidx_sess``. An FX universe is unaffected: no FX symbol starts with one of
+    :data:`_METAL_PREFIXES` or :data:`_CRYPTO_PREFIXES` or is a member of
+    :data:`_INDEX_SYMBOLS`, so ``fx_pairs`` and ``exness_fx_d1`` keep the classes - and therefore
+    the registered identities - they had.
+    """
+    name = symbol.upper()
+    if name.startswith(_CRYPTO_PREFIXES):
+        return "crypto"
+    if name.startswith(_METAL_PREFIXES):
+        return "metals"
+    if name in _INDEX_SYMBOLS:
+        return "indices"
+    return "major_pairs" if "USD" in name else "cross_pairs"
+
+
+def _normalize_cfd_costs(costs: dict, case_study_id: str) -> tuple[float, float]:
+    """(commission_bps, slippage_bps) for a CFD block; refuses what it cannot convert."""
+    commission_per_lot = float(costs.get("commission_per_lot") or 0.0)
+    if commission_per_lot != 0.0:
+        raise ValueError(
+            f"{case_study_id}: costs.commission_per_lot={commission_per_lot} cannot be "
+            "converted to basis points without the traded notional; declare the account's "
+            "commission in bps of notional or price it in the cost stage"
+        )
+    spread_bps = costs["spread_bps"]
+    universe = (_load_case_setup_yaml(case_study_id).get("universe") or {}).get("symbols") or []
+    classes = {_cfd_pair_class(str(symbol)) for symbol in universe} or {"major_pairs"}
+    tops = []
+    for pair_class in sorted(classes):
+        declared = spread_bps.get(pair_class)
+        if not declared:
+            raise ValueError(
+                f"{case_study_id}: costs.spread_bps has no range for {pair_class!r}, "
+                f"which the universe needs"
+            )
+        tops.append(float(declared[-1]))
+    return 0.0, max(tops)

@@ -1,0 +1,182 @@
+# exness_usidx_sess — monitoring thresholds (Chapter 26)
+#
+# ======================================================================================
+# EVIDENCE BOUNDARY
+# ======================================================================================
+# 0 phase-5 survivors of 1,403 scored specs at K = 1,780; phase 6 not opened; the declared
+# holdout 2026-03-01 .. 2026-08-31 is UNSCORED. There is no live stream to watch, no incumbent
+# and no challenger. Nothing here is evidence of an edge and nothing here permits live trading.
+#
+# **NOT ONE NUMBER BELOW IS CALIBRATED FROM THE SHARPE DISTRIBUTION OF THE 1,403 FAILED
+# TRIALS.** That is the easiest mistake to make in this file and it would be fatal: it would
+# fit a control to an outcome already shown to be noise. Every band comes from either
+#   (i)  a declared kill criterion (deploy/risk_config.yaml::breakers, BOT.md), or
+#   (ii) the SAMPLING NOISE of the statistic on a TWO-instrument book, computed from first
+#        principles and shown in full next to the number.
+# ======================================================================================
+#
+# Circuit-breaker thresholds are NOT here: they are the kill criteria and live in
+# deploy/risk_config.yaml under `breakers:`, next to the LiveRiskConfig they sit beside.
+# Account-level thresholds are in bots/_shared/monitor/account_limits.yaml. What is left —
+# drift, online detectors and the rollout gate — is declared here, before any of it runs.
+
+# --------------------------------------------------------------------------------------
+# drift.py — 26_mlops_governance/01_drift_monitoring.py
+# --------------------------------------------------------------------------------------
+drift:
+  # EVERYTHING IS PER SPEC. intraday and overnight are two books with two feature matrices
+  # (measured: the two financial.parquet digests differ, 2d51a786da3e17c3 vs c59e88c6b818f379)
+  # and two registries. A pooled drift report would average two processes.
+  per_spec: [intraday, overnight]
+
+  # THE REFERENCE WINDOW IS TRAIN/VALIDATION, NEVER THE HOLDOUT. Notebook 01 uses the holdout
+  # stream because its case study had already scored one; this bot has not. The reference is
+  # fold 0's validation block, the last one before the holdout opens, and drift.py's
+  # assert_no_holdout refuses any slice reaching into 2026-03-01 .. 2026-08-31.
+  reference:
+    # setup.yaml::evaluation — fold 0 validates 2025-08-29 .. 2026-02-26.
+    start: '2025-08-29'
+    end: '2026-02-26'
+  # Sessions in the "current" slice. 63 = one quarter of cash sessions, the same window kill
+  # criterion (b) uses for its hit rate, so the two agree rather than telling two stories.
+  current_window_sessions: 63
+
+  # Population Stability Index (26/01:384-388). Standard bands, unchanged.
+  psi:
+    watch: 0.10
+    alert: 0.25
+    n_bins: 10
+  # A K-S p-value this low, with a PSI already above `psi_floor`, promotes OK to WATCH.
+  ks:
+    watch_pvalue: 0.01
+    psi_floor: 0.02
+
+  # Rolling signal quality on the live stream (26/01:443+).
+  #
+  # THE BANDS ARE NOT THE NOTEBOOK'S AND THE ARITHMETIC IS HERE SO IT CAN BE CHECKED.
+  # Notebook 01 uses drops of 0.005 and 0.010 on a cross-section of hundreds of names. This
+  # book holds TWO. On a two-name book:
+  #
+  #   hit rate: per session, sd = sqrt(p(1-p)/2) = 0.354 at p = 0.5, so a 63-session mean has
+  #             a standard error of 0.354/sqrt(63) = 0.0446 and two independent windows differ
+  #             with sd sqrt(2) x 0.0446 = 0.063.
+  #   IC:       **the IC here is the PER-INDEX TIME-SERIES coefficient, not a cross-sectional
+  #             one.** A rank correlation over TWO points is +1 or -1 whatever the numbers are,
+  #             which is why 05_evaluation and 12_model_analysis were forked onto the
+  #             time-series statistic (BOT.md phases 3 and 4) and why kill criterion (b) uses a
+  #             hit rate rather than an IC. A 63-session time-series rank correlation has a
+  #             standard error of about 1/sqrt(63) = 0.126, and pooling the two indices divides
+  #             it by sqrt(2) = 0.089.
+  #
+  # At the notebook's 0.010 the hit-rate alert would fire on most runs by chance alone, and a
+  # monitor that cries wolf is a monitor nobody reads. The bands are ONE standard error (watch)
+  # and TWO (alert) of the statistic on THIS book. They are wide on purpose: on two names only
+  # a large move is readable at all, which is the same reason kill criterion (b) needs 21
+  # consecutive sessions and not one.
+  #
+  # AND NOTE WHAT THIS SECTION IS FOR. Phase 3 found 0 of 84 columns clearing Benjamini-Hochberg
+  # in either spec and phase 5 found no survivor, so a falling IC here is a DATA-QUALITY signal
+  # (the pipeline changed, a feed changed, the join broke) and is NOT evidence that an edge
+  # decayed. There is no edge on record to decay.
+  performance:
+    window_sessions: 63
+    ic_watch_drop: 0.089       # 1 se of a 63-session time-series IC pooled over two indices
+    ic_alert_drop: 0.178       # 2 se
+    hit_rate_watch_drop: 0.045  # ~1 se of a 63-session mean hit rate on a two-name book
+    hit_rate_alert_drop: 0.090  # ~2 se
+    mse_watch_ratio: 1.15
+    mse_alert_ratio: 1.30
+
+  # WHICH FEATURES THE DASHBOARD WATCHES, AND WHY IT IS DECLARED BY FAMILY.
+  # exness_fx_d1 lists "the eight PROCEED columns with the largest |IC|". This bot may not do
+  # that: 0 of 84 columns cleared the FDR screen in either spec, so an |IC| ranking over them
+  # is a ranking of noise, and choosing what to watch by it would be the generation-1
+  # calibration the mentor forbade. Instead the families are named from
+  # setup.yaml::features.families — the REGISTER, declared before any IC was read — and
+  # drift.py resolves each family's own `pattern` to columns at run time. If the register
+  # changes, this list is what has to change with it.
+  monitored_families:
+    - overnight and intraday      # the two legs the hypothesis splits the session into
+    - mean reversion              # the intraday leg's stated mechanism (lag-1 autocorr -0.1146)
+    - momentum                    # the overnight leg's stated mechanism
+    - volatility                  # the regime variable both legs condition on
+    - session realized volatility # this bot's own family, not inherited from the template
+    - structural spread           # the USTEC/US500 relationship; a break here is structural
+    - calendar and season         # cheap, and a calendar break is a venue change, not drift
+    - daily volatility and regime # the D1 join; a broken as-of join shows up here first
+  # Maximum columns per family carried into the report, so a 20-column family cannot drown the
+  # view. Taken in declared column order, never in IC order.
+  max_columns_per_family: 4
+
+# --------------------------------------------------------------------------------------
+# online_detectors.py — 26_mlops_governance/02_online_drift_detection.py
+# --------------------------------------------------------------------------------------
+online_detectors:
+  # EVERY WINDOW IS IN DECISION SESSIONS OF ONE SPEC, NOT IN DAYS, BARS OR DECISIONS OF THE
+  # BOT. The bot takes two decisions a session, but they belong to two different books; mixing
+  # them would halve every window's meaning. One spec takes about 252 decisions a year, and the
+  # overnight spec fewer still — 26 % of research sessions had no fill bar, so its effective
+  # rate is nearer 190/year on the full sample (0 % missing in 2026, so nearer 252 today).
+  units: decision_sessions_per_spec
+  adwin:
+    # Two 21-session windows = two trading months against each other; the detector can say
+    # nothing at all before 42 sessions.
+    window_size: 21
+    # Standardised mean shift that counts as drift. 1.4 is the notebook's value and it is
+    # deliberately loose: on a stationary stream the two-window statistic exceeds it on about
+    # 16 % of comparisons, so an ADWIN alert is a PROMPT TO LOOK and never a reason to stop.
+    # Nothing in this bot's control plane acts on it — the breakers do the acting.
+    sensitivity: 1.4
+    cooldown_sessions: 21
+  ddm:
+    min_samples: 20
+    warning_level: 1.5
+    drift_level: 2.0
+    # A session counts as a "bad day" when the share of indices whose sign the model got wrong
+    # exceeds this. ON A TWO-NAME BOOK THE ONLY VALUES ARE 0.0, 0.5 AND 1.0, so a floor of 0.52
+    # means "both wrong" and nothing else. That is a real limitation of DDM here and it is
+    # recorded rather than hidden by a floor that pretends to more resolution than exists.
+    error_rate_floor: 0.52
+    error_rate_resolution_note: >-
+      with two instruments the per-session error rate takes only the values 0, 0.5 and 1, so
+      DDM is effectively counting sessions on which BOTH indices were wrong
+  calibration_sessions: 126
+
+# --------------------------------------------------------------------------------------
+# rollout.py — 26_mlops_governance/03_safe_model_rollout.py
+# --------------------------------------------------------------------------------------
+# THE GATE IS FIXED BEFORE ANY CHALLENGER EXISTS. Every number below was written 2026-09-08,
+# when this bot had no incumbent and no challenger, and a promotion decision may only read it.
+rollout:
+  stages:
+    # No capital. The challenger produces a signal and the loop records it; nothing trades.
+    - {name: shadow, capital_fraction: 0.0, min_sessions: 63}
+    # Capital-capped A/B — AND IT DOES NOT FIT AT ANY ALLOCATION THIS ACCOUNT CAN CARRY.
+    # A tenth of capital.min_viable_allocated (3,000 USD) is 300 USD, against a smallest
+    # placeable position of 1,080.32 USD on US500 and 1,482.95 on USTEC (volume_min x
+    # trade_contract_size x price, measured 2026-09-08). Entering this stage needs
+    # capital.allocated of at least ~14,830 USD so that 10 % clears the USTEC floor, against
+    # an account whose measured equity is 896.97 USD. Recorded here rather than discovered by
+    # a rejected order.
+    - {name: ab_capped, capital_fraction: 0.10, min_sessions: 63}
+    - {name: staged_25, capital_fraction: 0.25, min_sessions: 63}
+    - {name: staged_50, capital_fraction: 0.50, min_sessions: 63}
+    - {name: full, capital_fraction: 1.00, min_sessions: 0}
+  promotion_criteria:
+    # 26/03:459-467, adopted unchanged except where this bot's own rules are stricter.
+    min_sharpe_improvement: 0.20
+    min_observation_sessions: 63
+    min_signal_correlation: 0.30
+    min_position_agreement: 0.30
+    max_drawdown_ratio: 1.25
+    # This bot's additions. A challenger must clear the bar the incumbent never did, and the
+    # comparison must be on the ACTIVE return over the 1/N long book on the same session
+    # window — the benchmark BOT.md's hypothesis names, and the one that caught the overnight
+    # book reproducing the drift (raw Sharpe +1.587, active -0.020).
+    benchmark: 1/N long book of US500 and USTEC on the same session window
+    sharpe_measured_on: active_return
+    require_holdout_scored: true
+    min_holdout_dsr: 0.95
+    # The trial count any future DSR must be deflated at, cumulatively for the BOT and not for
+    # one workspace. Two registries hold 890 each; a helper run inside one would report half.
+    trial_count_floor: 1780

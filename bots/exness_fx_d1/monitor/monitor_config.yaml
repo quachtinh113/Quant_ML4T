@@ -1,0 +1,147 @@
+# exness_fx_d1 — monitoring thresholds (Chapter 26)
+#
+# Circuit-breaker thresholds are NOT here: they are the kill criteria and live in
+# deploy/risk_config.yaml under `breakers:`, next to the LiveRiskConfig they sit beside.
+# Account-level thresholds are in bots/_shared/monitor/account_limits.yaml. What is left -
+# drift, online detectors and the rollout gate - is declared here, before any of it runs.
+
+# --------------------------------------------------------------------------------------
+# drift.py — 26_mlops_governance/01_drift_monitoring.py
+# --------------------------------------------------------------------------------------
+drift:
+  # THE REFERENCE WINDOW IS TRAIN/VALIDATION, NEVER THE HOLDOUT. Notebook 01 uses the
+  # holdout stream because that case study had already scored its holdout; this bot has not,
+  # so the reference is the last validation year the folds covered and the "current" slice is
+  # whatever the live stream has produced since. drift.py refuses a current window that
+  # reaches into 2025-09-01 .. 2026-08-31 while the holdout is unscored.
+  reference:
+    # setup.yaml::evaluation - fold 0 validates 2024-09-02 .. 2025-08-28, the last full
+    # validation year before the holdout. `end` is exclusive of the holdout by construction.
+    start: '2024-09-02'
+    end: '2025-08-28'
+  # Sessions in the "current" slice. 63 = one quarter of decisions, the window notebook 01
+  # uses and the same length as kill criterion (b)'s hit-rate window, so the two agree.
+  current_window_sessions: 63
+  # Population Stability Index (26/01:384-388). Standard bands, unchanged: below 0.10 the
+  # distribution has not moved enough to act on, 0.10-0.25 is a watch, 0.25 and above is an
+  # alert.
+  psi:
+    watch: 0.10
+    alert: 0.25
+    n_bins: 10
+  # A K-S p-value this low, combined with a PSI already above `psi_floor`, promotes OK to
+  # WATCH: a small distribution move that is statistically clear is worth looking at, a small
+  # move that is not is noise (26/01:386).
+  ks:
+    watch_pvalue: 0.01
+    psi_floor: 0.02
+  # Rolling signal quality on the live stream (26/01:443+). The baseline is the first
+  # `window_sessions` of the stream and the current slice is the last; a drop below `watch`
+  # is a watch, below `alert` an alert.
+  #
+  # THE BANDS ARE NOT THE NOTEBOOK'S, AND THIS IS WHY. Notebook 01 uses drops of 0.005 and
+  # 0.010 on a cross-section of hundreds of names. This book holds FIVE. The sampling noise
+  # of a 63-session mean on five names is:
+  #   hit rate: sd per session = sqrt(p(1-p)/5) ~ 0.22 at p = 0.5, so the standard error of
+  #             a 63-session mean is 0.22/sqrt(63) ~ 0.028, and two independent windows
+  #             differ with sd ~ 0.04.
+  #   IC:       a rank correlation over five points has sd ~ 0.5, so a 63-session mean has a
+  #             standard error of ~0.063.
+  # At the notebook's 0.010 the hit-rate alert would fire on roughly two runs in five by
+  # chance alone - a monitor that cries wolf is a monitor nobody reads. The bands below are
+  # one standard error (watch) and two (alert) of the statistic on THIS book. They are wide
+  # on purpose: on five names, only a large move is readable at all, which is the same reason
+  # BOT.md's kill criterion (b) needs 21 consecutive sessions and not one.
+  #
+  # And note what this section is for: this bot's phase-4 reading is that no model's IC is
+  # distinguishable from zero, so falling IC here is a DATA-QUALITY signal (the pipeline
+  # changed), not evidence that an edge decayed.
+  performance:
+    window_sessions: 63
+    ic_watch_drop: 0.063      # 1 standard error of a 63-session mean IC on five names
+    ic_alert_drop: 0.126      # 2 standard errors
+    hit_rate_watch_drop: 0.03  # ~1 standard error of a 63-session mean hit rate on five names
+    hit_rate_alert_drop: 0.06  # ~2 standard errors
+    mse_watch_ratio: 1.15
+    mse_alert_ratio: 1.30
+  # Features carried into the dashboard. The eight PROCEED columns with the largest |IC| in
+  # 05_evaluation (BOT.md phase 3), so the drift view watches what the model actually reads.
+  monitored_features:
+    - usd_corr_21d
+    - usd_corr_63d
+    - gold_corr_21d
+    - gold_corr_63d
+    - mom_skip_recent
+    - zscore_21d
+    - vol_gk_21d
+    - price_to_ma_21d
+
+# --------------------------------------------------------------------------------------
+# online_detectors.py — 26_mlops_governance/02_online_drift_detection.py
+# --------------------------------------------------------------------------------------
+online_detectors:
+  # EVERY WINDOW IS IN DECISION SESSIONS, NOT DAYS OR BARS. This bot takes about 252
+  # decisions a year (one per CME_FX session), so a detector tuned for an intraday stream
+  # would need years of data to fill its windows. See the module docstring for what "will not
+  # trip" means and for the expected time-to-first-alert at these settings.
+  units: decision_sessions
+  adwin:
+    # Two 21-session windows = two trading months compared against each other; the detector
+    # needs 42 sessions before it can say anything at all.
+    window_size: 21
+    # Standardised mean shift that counts as drift. 1.4 is the notebook's value and it is
+    # deliberately loose: on a stationary stream the two-window statistic exceeds 1.4 on
+    # about 16 % of comparisons, so an ADWIN alert is a PROMPT TO LOOK, never a reason to
+    # stop trading. Nothing in this bot's control plane acts on it; the breakers in
+    # deploy/risk_config.yaml do the acting. `test_drift.py` measures that false-alarm rate
+    # so the number above stays honest.
+    sensitivity: 1.4
+    # Sessions of silence after an alert, so one regime change is one alert, not twenty.
+    cooldown_sessions: 21
+  ddm:
+    # Sessions before DDM will report anything.
+    min_samples: 20
+    warning_level: 1.5
+    drift_level: 2.0
+    # A session counts as a "bad day" when the share of pairs whose sign the model got wrong
+    # exceeds this. 0.52 is the notebook's floor; the calibration window raises it when the
+    # model's own error rate is already higher.
+    error_rate_floor: 0.52
+  # Sessions of live stream used to calibrate both detectors before they may alert. 126 = two
+  # quarters, so the calibration itself spans two of the drift windows above.
+  calibration_sessions: 126
+
+# --------------------------------------------------------------------------------------
+# rollout.py — 26_mlops_governance/03_safe_model_rollout.py
+# --------------------------------------------------------------------------------------
+# THE GATE IS FIXED BEFORE THE CHALLENGER RUNS. Every number below was written on
+# 2026-09-07, before any challenger existed, and a promotion decision may only read them.
+rollout:
+  stages:
+    # No capital. The challenger produces a signal and the loop records it; nothing trades.
+    - {name: shadow, capital_fraction: 0.0, min_sessions: 63}
+    # Capital-capped A/B: the challenger gets a tenth of the allocation, the incumbent the
+    # rest. AND THAT DOES NOT FIT AT TODAY'S ALLOCATION: a tenth of 10,000 USD is 1,000 USD,
+    # BELOW the 0.01-lot granularity floor of about 1,160 USD on EURUSD (volume_min x
+    # trade_contract_size x price), so a challenger leg would round to zero lots and be
+    # rejected. Entering this stage therefore requires raising capital.allocated in
+    # deploy/risk_config.yaml to at least ~12,000 USD, or accepting that the challenger
+    # trades only the cheapest pair. Recorded here rather than hidden in a rounding rule.
+    - {name: ab_capped, capital_fraction: 0.10, min_sessions: 63}
+    # Staged allocation, one step per completed review.
+    - {name: staged_25, capital_fraction: 0.25, min_sessions: 63}
+    - {name: staged_50, capital_fraction: 0.50, min_sessions: 63}
+    - {name: full, capital_fraction: 1.00, min_sessions: 0}
+  promotion_criteria:
+    # 26/03:459-467, adopted unchanged except where this bot's own numbers are stricter.
+    min_sharpe_improvement: 0.20
+    # One quarter of decisions, the same window the drift and hit-rate rules use.
+    min_observation_sessions: 63
+    min_signal_correlation: 0.30
+    min_position_agreement: 0.30
+    max_drawdown_ratio: 1.25
+    # This bot's addition: a challenger must clear the same evidence bar the incumbent never
+    # did. Promotion is impossible until a holdout has been scored, so the gate says so
+    # explicitly instead of letting a shadow Sharpe stand in for evidence.
+    require_holdout_scored: true
+    min_holdout_dsr: 0.95

@@ -1,0 +1,27 @@
+{
+  "checkpoint_interval": 5,
+  "config_name": "tcn",
+  "family": "deep_learning",
+  "feature_sets": [
+    "financial",
+    "model_based"
+  ],
+  "label": "fwd_ret_1d",
+  "library": "pytorch",
+  "n_epochs": 100,
+  "n_folds": 8,
+  "params": {
+    "architecture": "tcn",
+    "dilations": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "dropout": 0.1,
+    "kernel_size": 3,
+    "lookback": 60,
+    "n_channels": 32
+  },
+  "seed": 42
+}

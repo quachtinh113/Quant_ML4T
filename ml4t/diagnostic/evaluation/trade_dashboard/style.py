@@ -1,0 +1,82 @@
+"""Dashboard styling constants.
+
+CSS styling for the Trade SHAP diagnostics dashboard.
+"""
+
+from __future__ import annotations
+
+from ml4t.diagnostic.visualization._colors import COLORS as _ML4T_COLORS
+
+# Build CSS with ML4T palette colors injected into CSS custom properties.
+# The rest of the CSS references var(--primary-color) etc.
+STYLED_CSS = (
+    "<style>\n"
+    "/* Professional theme colors — from canonical ML4T palette */\n"
+    ":root {\n"
+    f"    --primary-color: {_ML4T_COLORS['slate']};\n"
+    f"    --success-color: {_ML4T_COLORS['positive']};\n"
+    f"    --warning-color: {_ML4T_COLORS['amber']};\n"
+    f"    --error-color: {_ML4T_COLORS['negative']};\n"
+    "}\n"
+    "\n"
+    "/* Headers with professional styling */\n"
+    "h1 {\n"
+    "    color: var(--primary-color);\n"
+    "    font-weight: 600;\n"
+    "    padding-bottom: 1rem;\n"
+    "    border-bottom: 2px solid #e0e0e0;\n"
+    "}\n"
+    "\n"
+    "h2 {\n"
+    "    font-weight: 600;\n"
+    "    margin-top: 1.5rem;\n"
+    "}\n"
+    "\n"
+    "/* Enhanced metrics */\n"
+    '[data-testid="stMetricValue"] {\n'
+    "    font-size: 2rem;\n"
+    "    font-weight: 600;\n"
+    "}\n"
+    "\n"
+    "/* Polished containers */\n"
+    ".stExpander {\n"
+    "    border: 1px solid #e0e0e0;\n"
+    "    border-radius: 8px;\n"
+    "    box-shadow: 0 2px 4px rgba(0,0,0,0.05);\n"
+    "}\n"
+    "\n"
+    "/* Professional buttons */\n"
+    ".stButton>button {\n"
+    "    border-radius: 6px;\n"
+    "    font-weight: 500;\n"
+    "    transition: all 0.2s;\n"
+    "}\n"
+    "\n"
+    ".stButton>button:hover {\n"
+    "    transform: translateY(-1px);\n"
+    "    box-shadow: 0 4px 8px rgba(0,0,0,0.1);\n"
+    "}\n"
+    "\n"
+    "/* Download buttons styling */\n"
+    ".stDownloadButton>button {\n"
+    "    background-color: var(--primary-color) !important;\n"
+    "    color: white !important;\n"
+    "}\n"
+    "\n"
+    "/* Sidebar styling */\n"
+    '[data-testid="stSidebar"] {\n'
+    "    background-color: #f8f9fa;\n"
+    "}\n"
+    "\n"
+    "/* Tab styling */\n"
+    '.stTabs [data-baseweb="tab"] {\n'
+    "    padding: 0.5rem 1rem;\n"
+    "    font-weight: 500;\n"
+    "}\n"
+    "\n"
+    "/* Progress bars */\n"
+    ".stProgress > div > div {\n"
+    "    background-color: var(--success-color);\n"
+    "}\n"
+    "</style>\n"
+)

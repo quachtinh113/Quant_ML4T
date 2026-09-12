@@ -1,0 +1,501 @@
+# exness_usidx_sess — deployment risk configuration
+#
+# ======================================================================================
+# EVIDENCE BOUNDARY — READ THIS BEFORE ANY OTHER LINE
+# ======================================================================================
+# * Phase 5 ran in full and scored **0 survivors of 1,403 evaluated specs at K = 1,780**
+#   (bots/exness_usidx_sess/BOT.md, phase 5). Not one trial reaches a Deflated Sharpe Ratio
+#   of 0.50, let alone the drafted 0.95, on the active return over a 1/N long book.
+# * Phase 6 is NOT OPENED. Phase 7 is SEALED: the declared holdout 2026-03-01 .. 2026-08-31
+#   has never been read by any stage.
+# * The hypothesis, the kill criteria and the DSR benchmark below are all still a **DRAFT
+#   awaiting the user** (BOT.md, "Awaiting user approval").
+#
+# THEREFORE: THIS BOT HAS NO EDGE ON RECORD AND LIVE TRADING IS FORBIDDEN.
+# This file says what the limits WILL be if a survivor is ever found and the holdout is
+# scored once. It is a contract about how much may be lost, not a claim that anything can be
+# won, and it is NOT permission to trade. execution.mode is paper, armed is false,
+# live_risk_config.execution_mode is shadow — and the loop refuses to change any of them
+# without a person arming a single session AND a phase-7 marker file that does not exist.
+#
+# Precedent this follows exactly: bots/exness_fx_d1/BOT.md phases 8 and 9, "code ready, gate
+# not met: the package exists, is tested and runs; it is not permission to trade. DRY RUN
+# ONLY", written while that bot also had no survivor at K = 3,204 and a sealed holdout.
+# ======================================================================================
+#
+# Read by bots/exness_usidx_sess/deploy/deployment_loop.py and split across three layers,
+# because a limit put in the wrong layer is not enforced by the thing meant to enforce it:
+#
+#   live_risk_config:  ml4t.live.LiveRiskConfig — PRE-TRADE controls SafeBroker applies to
+#                      each order before it reaches the adapter (25_live_trading/10).
+#   breakers:          this bot's circuit breakers (26_mlops_governance/04) on the SHARED
+#                      state machine bots/_shared/monitor/base.py. Drawdown, hit rate, cost,
+#                      swap and the DST check live HERE, not in LiveRiskConfig: they are
+#                      properties of a RUN of trades, not of one order.
+#   account limits:    NOT in this file. bots/_shared/monitor/account_limits.yaml holds the
+#                      account tier (equity, margin, stop-out, open positions and gross
+#                      notional across EVERY magic) at the strictest limit any bot declares.
+#                      This bot writes no account breaker and re-implements none.
+#
+# Sources, in order of authority:
+#   1. bots/exness_usidx_sess/BOT.md, "Kill criteria" (a)..(g) — DRAFT, quoted next to what
+#      implements each letter.
+#   2. case_studies/exness_usidx_sess/config/setup.yaml (universe, decision, costs, execution).
+#   3. Read-only MT5 measurements on demo 206539306 @ Exness-MT5Trial7, 2026-09-08.
+# NOTHING here is calibrated from the Sharpe distribution of the 1,403 failed trials. Every
+# threshold comes from a declared kill criterion or from a measured price / contract fact.
+
+bot_id: exness_usidx_sess
+case_study: exness_usidx_sess
+
+# Magic number. The allocation table is bots/_shared/__init__.py::MAGIC_ALLOCATION and this
+# value is asserted against it at startup; bots/tests/test_magic_numbers.py globs
+# bots/*/deploy/risk_config.yaml and enforces uniqueness across bots. 202500 (the retired
+# legacy V9 Continuum bot) is reserved — and TWO positions carrying it were open on this login
+# on 2026-09-08, which is why reconciliation counts every magic.
+magic: 260902
+
+execution:
+  # "paper" makes MT5Broker.assert_paper_trading refuse a non-demo account, at connect and
+  # before every order. "live" additionally needs armed_live=True from a person AND refuses a
+  # demo account. Paper is the only value this bot may carry until phase 7 has been scored.
+  mode: paper
+  # THE DEFAULT OF EVERY RUN (SUBMIT_PAPER_ORDERS = False, 25_live_trading/02:121). Arming is
+  # a command-line flag a person types for one session; it is never written true here, and
+  # while the kill criteria are a draft the loop REFUSES --arm outright.
+  armed: false
+  # Slippage the terminal may take before rejecting the deal, in points. `point` is 0.01 on
+  # both indices (digits 2), so 40 points = 0.40 index points = 5.2 bps on US500 and 1.3 bps
+  # on USTEC — about ten and three times the live quoted spread measured 2026-09-08
+  # (US500 40 points = 0.52 bps, USTEC 112 points = 0.38 bps). Deliberately wider than the
+  # spread and far narrower than a session move (median 29-49 bps, BOT.md phase 1).
+  deviation_points: 40
+  close_deviation_points: 60
+  # Refuse an order whose order_calc_margin exceeds this fraction of margin_free. Unknown
+  # margin fails closed (MT5Broker.margin_check).
+  max_margin_fraction: 0.20
+  # An order that rounds below volume_min is REJECTED, never bumped up. This is the parity gap
+  # recorded under `capital` and in BOT.md: the research engine sizes fractionally, the
+  # adapter cannot.
+  min_lot_policy: reject
+
+capital:
+  # Capital allocated to this bot, in account currency.
+  #
+  # MEASURED read-only 2026-09-08 on demo 206539306 @ Exness-MT5Trial7 (no order_send):
+  # balance 894.24 USD, equity 896.97, margin 1.38, margin_free 895.59, leverage 1:2000,
+  # margin_so_call 60 %, margin_so_so 0.0 (no stop-out level reported by this terminal),
+  # 2 open positions, BOTH of the retired legacy magic 202500.
+  #
+  # setup.yaml::execution.initial_cash (100,000) is the RESEARCH notional and is deliberately
+  # not reused: a research book is scale-free, a live book is not.
+  allocated: 900.0
+  currency: USD
+  # THE PARITY GAP, AND WHY THIS ACCOUNT CANNOT FUND THIS BOT AT ALL.
+  # setup.yaml::execution.share_type is `fractional`, so the research engine can hold any
+  # weight it likes. MT5 cannot: volume_min x trade_contract_size, read from symbol_info on
+  # 2026-09-08 and never assumed, is
+  #     US500m  0.14 lot x 1.0 = 0.14 index units; at ask 7,716.56  ->  1,080.32 USD
+  #     USTECm  0.05 lot x 1.0 = 0.05 index units; at ask 29,659.06 ->  1,482.95 USD
+  # and MT5Broker.normalize_lot rounds DOWN and REJECTS below volume_min. So a target below
+  # the floor is refused, NOT scaled down, and a backtest that filled it is describing a trade
+  # this account cannot place. At 897 USD of equity the smallest possible US500 position is
+  # 1.20x the whole account and the smallest USTEC position 1.65x.
+  #
+  # MINIMUM VIABLE ALLOCATION, arithmetic in full (prices of 2026-09-08):
+  #   * the declared book is time_series_threshold + equal_weight over 2 symbols, so a session
+  #     holding both on the same side runs each leg at weight 0.5:
+  #         US500  1,080.32 / 0.5 = 2,160.64 USD
+  #         USTEC  1,482.95 / 0.5 = 2,965.90 USD   <- binding
+  #   * a one-long / one-short session normalises WITHIN each side, so each leg runs at
+  #     weight 1.0 and needs only 1,482.95 USD; the two-on-one-side case is the binding one.
+  # 3,000 USD is the rounded binding figure. Below it the loop produces orders that
+  # normalize_lot rejects, and `capital_viability` in every run record reports viable false
+  # with this arithmetic and BLOCKS staging. Raising `allocated` is a funding decision for the
+  # user, not a code change — and it would still not create an edge.
+  min_viable_allocated: 3000.0
+  volume_min:
+    US500: 0.14
+    USTEC: 0.05
+  volume_step: 0.01
+  contract_size: 1
+  # Measured ask at the moment of the reading, kept so the arithmetic above is reproducible.
+  measured_price_2026_09_08:
+    US500: 7716.56
+    USTEC: 29659.06
+  measured_min_notional_usd:
+    US500: 1080.32
+    USTEC: 1482.95
+
+# --------------------------------------------------------------------------------------
+# ml4t.live.LiveRiskConfig — the PRE-TRADE controls of 25_live_trading/10_safety_risk_demo
+# --------------------------------------------------------------------------------------
+# The class carries the per-order and per-position limits AND the loss limits
+# (max_daily_loss, max_drawdown_pct), so kill criterion (a) maps straight onto
+# max_drawdown_pct and SafeBroker refuses the order before it is sent. The matching breakers
+# below are the SECOND tier, not a replacement: a breaker adds the state machine, the event
+# log, the HALF_OPEN probe and the kill switch that latches across a restart.
+live_risk_config:
+  # ONE SWITCH, NOT TWO. ml4t.live.ExecutionMode is shadow | paper | live and
+  # LiveRiskConfig.__post_init__ DERIVES shadow_mode from it, so shadow_mode is deliberately
+  # absent from this file — there is nothing here to get out of step with itself. `shadow`
+  # books orders into a VirtualPortfolio and they never reach the adapter.
+  # The two layers carry DIFFERENT values on purpose: this is the SafeBroker layer and it is
+  # shadow; execution.mode above is the BROKER layer and it is paper, because
+  # MT5Broker._guard_mode branches on it and paper runs assert_paper_trading(). If an order
+  # ever did get past SafeBroker it would still have to prove the account is a demo.
+  execution_mode: shadow
+
+  # -- order size -----------------------------------------------------------------------
+  # QUANTITIES ARE INDEX UNITS (lots x trade_contract_size, and contract_size is 1.0 on both
+  # indices, so one unit is one index point: 7,717 USD of US500, 29,659 USD of USTEC). This is
+  # NOT exness_fx_d1's convention, where a unit is one unit of base currency; the difference
+  # is the contract size, read from symbol_info and never assumed.
+  #
+  # Derived against capital.min_viable_allocated (3,000 USD), not against today's 900, so
+  # funding the account to a workable balance cannot silently loosen them. The largest leg the
+  # design can ask for is a one-sided long_short leg at weight 1.0:
+  #     3,000 / 7,716.56 = 0.389 units of US500;  3,000 / 29,659.06 = 0.101 units of USTEC.
+  # 0.80 units is about 2x the larger of those — headroom for a rotation that opens before the
+  # other leg closes, and small enough that a sizing bug cannot build a lot-sized position.
+  # RAISING capital.allocated ABOVE min_viable_allocated MEANS RE-DERIVING THESE FOUR.
+  max_order_shares: 0.80
+  # 2x min_viable_allocated. This is the BINDING cap of the two: 0.80 units of USTEC would be
+  # 23,727 USD, so the value limit stops it long before the unit limit does. Both are declared
+  # because a unit cap and a value cap fail in different ways (a bad price makes the value cap
+  # useless; a bad contract size makes the unit cap useless).
+  max_order_value: 6000.0
+
+  # -- position size --------------------------------------------------------------------
+  # One index carries at most one leg of the book, so the position cap equals the order cap.
+  max_position_shares: 0.80
+  max_position_value: 6000.0
+  # The two symbols of universe.symbols; the book never holds a name outside them.
+  max_positions: 2
+  # Gross exposure of the book in account currency. The design book reaches 2x allocated gross
+  # (one long leg + one short leg, each normalised within its own side); 12,000 =
+  # 4x min_viable_allocated is twice that. Far below what 1:2000 leverage would allow, and
+  # ABOVE the account tier's 9,000 USD across every magic — the account tier is the binding
+  # one, which is the point of having it.
+  max_total_exposure: 12000.0
+
+  # -- rate ------------------------------------------------------------------------------
+  # TWO DECISIONS A SESSION, about six hours apart (us_cash_open and us_cash_close), so no
+  # minute ever carries both. One decision's full rotation of the 2-symbol long-short book is
+  # 2 closes + 2 opens = 4 orders. Four is therefore one decision's whole budget and anything
+  # above it inside a minute is a loop bug, not a decision.
+  max_orders_per_minute: 4
+
+  # -- loss limits: kill criteria enforced BEFORE the order is sent ------------------------
+  # Kill criterion (a) verbatim: "drawdown from peak > 8 % of allocated capital".
+  max_drawdown_pct: 0.08
+  # 2 % of min_viable_allocated (3,000) = 60 USD. The criteria name no daily figure, so it is
+  # DERIVED, and the derivation is from a measured PRICE fact and never from the trial
+  # distribution: BOT.md phase 1 measured a median absolute session move of 29-49 bps on these
+  # two indices, so a 2 % loss on an allocation held at gross 1.0 needs a 200 bps adverse move
+  # — four to seven times the median session. The authoritative rule is DailyLossBreaker
+  # below, which works in PERCENT and so does not go stale when the allocation changes; this
+  # absolute figure is only the pre-trade second line of defence.
+  max_daily_loss: 60.0
+
+  # -- data and fat finger -----------------------------------------------------------------
+  # A reference price this far from the order price is a stale or wrong quote. 1 % is about
+  # 2-3x the median session move (0.29-0.49 %) of these indices: above normal, below a gap.
+  max_price_deviation_pct: 0.01
+  # Both decisions are H1 bar closes INSIDE or AT the edge of the NYSE cash session, where
+  # these CFDs quote continuously. A quote older than 15 minutes there means the feed is
+  # broken. The loop primes this guard with record_market_snapshot() from symbol_info_tick
+  # before every leg.
+  max_data_staleness_seconds: 900
+  # Two decisions a session, hours apart: two identical orders inside a minute is a retry bug.
+  dedup_window_seconds: 60
+
+  # -- universe -----------------------------------------------------------------------------
+  # BARE names. The Market Watch names carry this account's suffix (US500m, USTECm) and the
+  # mapping lives only in bots/_shared/mt5_loader.py::SYMBOL_MAP.
+  allowed_assets: [US500, USTEC]
+  blocked_assets: []
+
+  # -- persistence and latching ----------------------------------------------------------
+  # Kill criterion (d): reconciliation between the run record and positions_get disagrees.
+  fail_on_reconciliation_mismatch: true
+  # Armed by a person or by a breaker, never by default; latches across process restarts.
+  kill_switch_enabled: false
+  allow_reducing_risk_when_killed: true
+  halt_on_reducing_risk_failure: true
+  # Relative to bots/exness_usidx_sess/deploy/state/.
+  state_file: risk_state.json
+  journal_file: audit_journal.jsonl
+  fail_on_journal_error: true
+
+# --------------------------------------------------------------------------------------
+# CFD guards at the moment of execution (mt5-exness-broker.md section 4)
+# --------------------------------------------------------------------------------------
+cfd_guards:
+  # THE DAILY BREAK IS DECLARED IN NEW YORK LOCAL TIME, NOT IN UTC, AND THAT IS THE POINT.
+  # setup.yaml::decision.trade_hours_follow_dst_of is America/New_York, measured on 39
+  # readable, transition-free months of US500 H1 bars: the daily Globex break ends at 18:00
+  # New York in every one of them, so in UTC it is 21:00-22:00 in summer and 22:00-23:00 in
+  # winter. A UTC constant here would be wrong for five months of every year, which is kill
+  # criterion (g)'s whole subject. The loop converts with zoneinfo at run time.
+  blocked_execution_windows_local:
+    - zone: America/New_York
+      start: "17:00"
+      end: "18:00"
+      reason: "daily CFD break; no continuous quote, and the reopen gaps"
+  # Refuse a leg whose LIVE spread at the moment of execution exceeds the assumed p90 for that
+  # index by more than this multiple.
+  max_spread_multiple_of_p90: 2.0
+  # WHICH p90 THE GUARD USES, AND WHY IT IS NOT THE ONE THE BACKTEST CHARGES.
+  # setup.yaml::costs.spread_bps.indices declares [3.07, 4.05] and the backtest charges 4.05
+  # bps a crossing, deliberately conservative because the development sample spans a regime
+  # break in 2024-10 and the engine takes ONE number. A live execution guard has the opposite
+  # job: it must notice an abnormal print TODAY. 4.05 bps is about four times what this
+  # account currently quotes, so a guard set there would never fire. These are
+  # setup.yaml::costs.spread_bps_by_year.recent_regime_p90, the post-2024-11 regime, and the
+  # live reading of 2026-09-08 confirms them: US500m spread 40 points / 7,716.36 mid = 0.52
+  # bps, USTECm 112 points / 29,658.50 mid = 0.38 bps. The divergence between the guard and
+  # the charged cost is recorded in BOT.md as a declared inconsistency, not hidden.
+  assumed_spread_p90_bps:
+    US500: 1.05
+    USTEC: 0.87
+  # A session with no quote stages nothing. The NYSE calendar decides whether a cash session
+  # exists at all: on a US market holiday Exness still quotes the CFD and this bot still has
+  # no row and places no order.
+  refuse_when_market_closed: true
+
+# --------------------------------------------------------------------------------------
+# Circuit breakers (26_mlops_governance/04), mapped letter by letter to the kill criteria
+# --------------------------------------------------------------------------------------
+breakers:
+  # Every breaker below is built with pending_user_approval true while the criteria are a
+  # DRAFT (BOT.md, "Kill criteria"). build_manager() refuses to build unless the caller passes
+  # allow_draft_criteria=True, and the deployment loop refuses --arm while it is true.
+  pending_user_approval: true
+  # How long a tripped breaker stays OPEN before it probes HALF_OPEN. This bot decides twice a
+  # session, so 24 hours is two decisions: short enough that a probe happens on the next
+  # session, long enough that no breaker can clear itself before a person reads the alert.
+  recovery_timeout_hours: 24
+
+  # (a) "drawdown from peak > 8 % of allocated capital" -> DrawdownBreaker
+  drawdown:
+    max_drawdown_pct: 0.08
+  # daily loss, derived as above -> DailyLossBreaker
+  daily_loss:
+    max_daily_loss_pct: 0.02
+  # (b) "rolling 63-session hit rate < 0.5 for 21 consecutive sessions, COUNTED SEPARATELY PER
+  # SPEC (intraday and overnight are different processes and one must not mask the other)".
+  # ConsecutiveLossBreaker counts a losing streak, which is a different rule, so
+  # monitor/circuit_breakers.py carries a RollingHitRateBreaker and builds TWO of them —
+  # strategy_hit_rate_intraday and strategy_hit_rate_overnight. Feeding both from one pooled
+  # series would be exactly the masking the criterion exists to prevent.
+  hit_rate:
+    window_sessions: 63
+    min_hit_rate: 0.5
+    consecutive_sessions: 21
+    per_spec: [intraday, overnight]
+  # (c) "realised round-trip cost > 1.5x the assumed cost over one month".
+  # TWO ASSUMED COSTS EXIST AND THE BREAKER TAKES THE TIGHTER, WHICH IS RECORDED AS AN OPEN
+  # DEFECT IN THE CRITERION'S WORDING (BOT.md phase 8):
+  #   * declared_round_trip_bps 8.10 = 2 x setup.yaml::costs.spread_bps.indices[1] (4.05),
+  #     which is literally "the assumed cost" the backtest charged. 1.5x it is 12.15 bps, four
+  #     to six times what this account quotes today, so on its own it is not a control.
+  #   * live_regime_round_trip_bps 2.10 = 2 x the recent-regime p90 of the WORSE index
+  #     (US500 1.05). This is a measured spread on this account's own tape, not a statistic of
+  #     the 1,403 failed trials.
+  # The breaker trips on min(declared, live_regime) x multiple. When the user approves the
+  # criteria, (c) should be re-worded to say which one it means.
+  cost:
+    declared_round_trip_bps: 8.10
+    live_regime_round_trip_bps: 2.10
+    multiple: 1.5
+    window_days: 31
+    min_round_trips: 10   # below this a monthly average is noise, so the breaker abstains
+  # (d) "reconciliation between the run record and positions_get disagrees" ->
+  # ReconciliationBreaker. Trips IMMEDIATELY, never probes HALF_OPEN, latches the kill switch.
+  # It counts every magic: two positions of the retired 202500 were open on 2026-09-08 and an
+  # unallocated magic must raise rather than be ignored.
+  reconciliation: {}
+  # (f) "realised swap per night > setup.yaml::costs.swap over one week". PER SYMBOL, because
+  # the two indices declare very different values. symbol_info 2026-09-08, swap_mode 1 (points
+  # per lot per night), swap_rollover3days 5 = FRIDAY (not Wednesday as on the FX pairs).
+  # A SHORT pays nothing on both, so any realised swap on a short leg is also a breach.
+  swap:
+    declared_points_per_lot_per_night:
+      US500: {long: -147.4, short: 0.0}
+      USTEC: {long: -592.7, short: 0.0}
+    rollover3days: friday
+    # 5 % of the larger declared magnitude, rounded: a broker changing its financing by more
+    # than this inside a week is a change of terms, not noise.
+    tolerance_points: 30.0
+    consecutive_nights: 7
+  # (g) "the daily break stops ending at 18:00 New York, i.e. the trading hours stop following
+  # decision.trade_hours_follow_dst_of (checked on the DST changeover weeks)".
+  # A breaker no other bot has, because no other bot's decision instants ride a foreign DST
+  # rule while its server clock does not. TradeHoursDstBreaker reads the H1 tape and asserts
+  # the break still ends at the declared local hour. One reading can be an outage; two inside
+  # a window is a venue change, and every decision instant this bot computes would then be an
+  # hour wrong.
+  trade_hours_dst:
+    expected_break_end_local: "18:00"
+    zone: America/New_York
+    escalate_after: 2
+    window_sessions: 10
+  # A pause the criteria do not name, declared here rather than inferred later: five
+  # consecutive losing round trips. At a hit rate near 0.5 that is 1/32 by chance, so it is a
+  # pause that probes HALF_OPEN, not a retirement.
+  consecutive_loss:
+    max_consecutive: 5
+  # Infrastructure, not one of the lettered criteria.
+  latency:
+    max_latency_ms: 2000.0
+    n_recent: 10
+
+# --------------------------------------------------------------------------------------
+# (e) A MISSING DECISION BAR — AND THE ONE PLACE THIS BOT DIFFERS MOST FROM exness_fx_d1
+# --------------------------------------------------------------------------------------
+# BOT.md kill criterion (e): "a decision instant has no bar to fill at -> no order that session
+# (A NORMAL STATE FOR THE OVERNIGHT SPEC, NOT AN INCIDENT; it is a kill criterion only if it
+# starts happening to the intraday spec)".
+#
+# This is measured, not asserted. Over 1,930 index-sessions of research data:
+#   intraday   0 of 1,930 missing (0.0 %)  -> a miss IS anomalous, escalate like exness_fx_d1
+#   overnight  504 of 1,930 missing (26 %) -> STRUCTURAL: the index shuts for the weekend AT
+#              the Friday cash close, and through 2022 the daily break sat on that close.
+#              By year: 2022 98 %, 2023 55 %, 2024 20 %, 2025 7 %, 2026 0 %.
+# Escalating the overnight spec on a missing bar would page a human 504 times for a market
+# structure setup.yaml already declares. So the overnight spec gets NO miss-count breaker at
+# all; what it gets is a COVERAGE FLOOR breaker against
+# setup.yaml::decision.min_fill_coverage (0.60) — the figure declared before phase 4 and
+# therefore not chosen from an outcome. Coverage below 0.60 over a rolling 63 sessions is a
+# feed or venue change, because the recent regime runs at 93-100 %.
+missing_decision_bar:
+  intraday:
+    action: no_trade_this_decision
+    escalate_after: 3
+    window_sessions: 21
+  overnight:
+    action: no_trade_this_decision
+    escalate_after: null          # never escalates on a count; see min_fill_coverage below
+    min_fill_coverage: 0.60       # setup.yaml::decision.min_fill_coverage, pre-phase-4
+    coverage_window_sessions: 63
+
+# --------------------------------------------------------------------------------------
+# Retire rules (BOT.md kill criteria, last paragraph) — not breakers: they END the bot
+# --------------------------------------------------------------------------------------
+# Neither input exists (16_costs has not run and cannot: phase 6 is not opened; the holdout is
+# unscored), so monitor/retire.py reports not_computable with the reason and what unblocks it.
+# It never defaults to a pass.
+retire:
+  # "16_costs re-estimates the breakeven below the p90 spread measured on the REAL account".
+  # The real Pro account has NEVER been read; the figure below is the DEMO declaration and is
+  # a placeholder the rule itself refuses to use (real_account_measured false).
+  min_breakeven_cost_bps: 4.05
+  real_account_measured: false
+  # "the holdout PSR against a 1/N long book on the same session window is below 0.5".
+  min_holdout_psr_vs_benchmark: 0.5
+
+# --------------------------------------------------------------------------------------
+# Decision schedule — DERIVED, NEVER TYPED
+# --------------------------------------------------------------------------------------
+# THE HOURS 14:00 / 15:00 / 20:00 / 21:00 UTC DO NOT APPEAR IN ANY CODE PATH. They are what
+# the derivation produces today; they are not inputs. The trade hours follow New York DST and
+# the server clock does not (it is UTC+0 all year, measured 2026-09-05), so a hard-coded UTC
+# hour is wrong for roughly five months of every year and on every half day.
+#
+# The loop derives both instants per session from
+#   * the NYSE calendar, through case_studies/exness_usidx_sess/_features.session_grid — the
+#     same function 01, 02, 03 and the point-in-time test call, so live and research cannot
+#     drift apart; it also carries the 13:00 half-days;
+#   * cross-checked against bots/_shared/sessions.SESSIONS["us_cash"] (09:30-16:00
+#     America/New_York, real DST through zoneinfo);
+#   * converted to server time with bots/_shared/sessions.ServerClock.to_server using the
+#     measured offset below.
+decision:
+  snapshot: us_cash_open_and_close
+  open_delay_minutes: 30                    # mirrors setup.yaml::decision
+  session_calendar: NYSE
+  session_close_tolerance_minutes: 60       # one H1 bar; exness_fx_d1 uses 240 for its H4 grid
+  execution_delay: next_bar_open
+  execution_tolerance_minutes: 60           # "no bar, no order"
+  # setup.yaml::decision.server_clock, measured on this login 2026-09-05 (ServerClock.measure
+  # on BTCUSDm: offset 0). follows_dst_of null is about the CLOCK and is a different fact from
+  # trade_hours_follow_dst_of below, which is about the INSTRUMENT.
+  server_clock:
+    utc_offset_minutes: 0
+    measured_at: "2026-09-05T12:48:33+00:00"
+    follows_dst_of: null
+  trade_hours_follow_dst_of: America/New_York
+  # The two specs. Each is its own book with its own model, its own registry and its own
+  # decision instant; they are never netted before the broker sees them.
+  specs: [intraday, overnight]
+
+# --------------------------------------------------------------------------------------
+# Evidence boundary — enforced by the loop, not by good intentions
+# --------------------------------------------------------------------------------------
+evidence_boundary:
+  # setup.yaml::evaluation.holdout_start / holdout_end. While holdout_scored is false the loop
+  # clamps any deployment refit to end strictly before holdout_start and ASSERTS it, the
+  # default decision date is the last session before it, and the parity replay reports the
+  # order tape only — no return, no Sharpe, no equity curve.
+  holdout_start: '2026-03-01'
+  holdout_end: '2026-08-31'
+  # Written by the holdout stages when they have run. The file is ABSENT and a flag alone
+  # cannot open the boundary.
+  holdout_scored_marker: state/holdout_scored.json
+  # Phase 5's own verdict, stamped into every run record so no live number can ever be read
+  # without it.
+  phase5_survivors: 0
+  phase5_specs_scored: 1403
+  phase5_trial_count: 1780
+  phase6_opened: false
+  # TWO REGISTRIES, ONE BOT. One workspace per spec (BOT.md Decisions log 2026-09-08), so no
+  # single registry can answer "what is K for this bot". Every DSR helper reads ONE registry
+  # and would report K = 890, exactly half the truth. Any DSR printed from inside a stage of
+  # this bot is WRONG and is forbidden; only a two-registry reader may be used.
+  registries:
+    intraday: experiments/usidx_intraday/exness_usidx_sess/run_log/registry.db
+    overnight: experiments/usidx_overnight/exness_usidx_sess/run_log/registry.db
+
+# --------------------------------------------------------------------------------------
+# Model — what the loop is allowed to deploy
+# --------------------------------------------------------------------------------------
+model:
+  # NULL IS THE DEFAULT AND THE ONLY HONEST VALUE: phase 5 produced no survivor, so no model
+  # is deployable. With null the loop runs the data, feature, prediction, sizing and parity
+  # steps off REGISTERED VALIDATION predictions and stops, saying why.
+  training_hash: null
+  label: null
+  # The validation prediction populations the plumbing test may replay. Registered, complete,
+  # validation-only: no refit, no data extension, no holdout read. NOTE THE ASYMMETRY — the
+  # overnight registry has NO exness_usidx_sess:validation-predictions population, only the
+  # two per-family ones, because the deleted backtest generation took the combined population
+  # with it (mentor review section 1). Recorded rather than papered over.
+  plumbing_prediction_population:
+    intraday: 'exness_usidx_sess:validation-predictions'   # 3cc74387cd7c
+    overnight: 'exness_usidx_sess-gbm-validation-v1'       # 393fd67e1f9e
+  # The signal family and setting the live book would use. Both are members of the DECLARED
+  # sweep (setup.yaml::backtest.sweep) and neither is chosen by its result.
+  # WHY NOT fixed_threshold: the mentor proved that with long_short the library sets the lower
+  # threshold to 1.0 - threshold (case_studies/utils/signals.py:53-62, warned at :36-37), so a
+  # regression score of order 1e-3 never lands in the flat branch and generation 1's 1,068
+  # fixed_threshold trials ran an ALWAYS-INVESTED book rather than the one BOT.md's hypothesis
+  # describes. setup.yaml now declares threshold_grid.fixed_threshold_convention: signed, which
+  # fixes it, but no generation has yet been scored with the correction. Until one has, the
+  # live book is the family whose recorded generation tested what was declared. A MECHANICAL
+  # exclusion, not a family dropped after seeing it lose - that would be laundering.
+  signal_family: per_symbol_rolling_percentile
+  signal_lookback: 252
+  # LONG ONLY, and that is not a preference. case_studies/exness_usidx_sess/_sweep.py declares
+  # this family with `long_short: False` / `direction: long_only`, because the pinned
+  # config/backtest/base.yaml sets allow_short_selling WITHOUT allow_leverage, so the engine
+  # runs a cash account and a short leg is sized by the cash on hand. The loop ASSERTS this
+  # value against the declared sweep and refuses to run when the two disagree: the live book
+  # has to be the book that was backtested.
+  long_short: false
+  # Refit cadence in calendar days. The research folds are 18 months train / 6 months
+  # validate; a monthly refit keeps the deployment fit inside the same geometry.
+  refit_every_days: 31
+  # Stamped into every run record so a number read off a live tape can never be compared with
+  # a backtest without its multiple-testing context.
+  trial_count_at_deployment: 1780

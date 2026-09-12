@@ -1,0 +1,38 @@
+# Model configurations for dir_tb_8h (classification, three classes: -1, 0, +1)
+# Each entry references a preset in case_studies/config/{model_type}/.
+# Comment out lines to skip configs; add new preset names to extend.
+
+linear:
+- logistic_none
+- logistic_l2_C0.001
+- logistic_l2_C0.01
+- logistic_l2_C0.1
+- logistic_l2_C1.0
+- logistic_l2_C10.0
+- logistic_l2_C100.0
+- logistic_l1_C0.001
+- logistic_l1_C0.01
+- logistic_l1_C0.1
+- logistic_l1_C1.0
+- logistic_l1_C10.0
+- logistic_l1_C100.0
+gbm:
+- default_multiclass
+- leaves_7_multiclass
+- leaves_15_multiclass
+- leaves_31_multiclass
+- leaves_63_multiclass
+deep_learning:
+- nlinear
+- lstm_h64
+tabular_dl:
+- tabm_s
+- tabm_m
+- tabm_l
+# No `causal_dml`. The DML nuisance models are regressors - `case_studies/utils/causal.py`
+# builds both as `HistGradientBoostingRegressor` - and there is no classification branch, so
+# running a declared causal menu on this label fits a regressor to a class target and banks the
+# result as a canonical causal estimate. Declaring it here was the whole of the trap in
+# ml4t/agent-workspace#396: nothing runs it today, and the next reader comparing the config count
+# against the production count sees a missing causal result and extends the notebook to cover it.
+# The return labels keep theirs; a continuous target is what DML as implemented estimates.

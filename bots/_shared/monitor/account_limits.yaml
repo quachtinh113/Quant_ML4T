@@ -1,0 +1,117 @@
+# Account-level breaker thresholds, shared by every bot on this MT5 account.
+#
+# TWO TIERS, AND THIS IS THE OUTER ONE.
+#   * Account tier (here, bots/_shared/monitor/): equity drawdown, daily equity loss, margin
+#     level, distance to the broker stop-out, open positions and orders across EVERY magic.
+#     One trip writes the halt file and every bot on the account stops.
+#   * Strategy tier (bots/<bot_id>/monitor/circuit_breakers.py): that bot's own kill criteria.
+#     A bot never re-implements an account breaker.
+#
+# THE ACCOUNT TIER USES THE STRICTEST LIMIT ANY BOT ON THE ACCOUNT DECLARES. It has to: the
+# account is one pool of equity and one margin call, so a tier that is looser than the
+# tightest bot would let that bot's own rule be overtaken by another bot's losses. Declared
+# per-bot limits on 2026-09-07:
+#     bots/xau_fx_mt5/BOT.md  drawdown from peak 6 %, daily loss 2 %   <- strictest, used here
+#     bots/exness_fx_d1/BOT.md  drawdown from peak 8 % of allocated capital, daily loss
+#                               derived at 2 % of allocated capital
+#     bots/exness_usidx_sess/BOT.md  DECLARED 2026-09-08 (phase 8): drawdown from peak 8 % of
+#                               allocated capital (kill criterion (a)), daily loss derived at
+#                               2 % of allocated capital. NEITHER IS TIGHTER THAN THE 6 % / 2 %
+#                               ALREADY IN FORCE HERE, so no number below moved. The criteria
+#                               are still a DRAFT awaiting the user (BOT.md, "Kill criteria"),
+#                               and this bot has NO phase-5 survivor and an UNSCORED holdout:
+#                               the declaration is a contract about loss, not a claim of edge.
+#     exness_gold_sess / exness_btc_8h: not yet declared
+# When a new bot declares something tighter, this file moves with it and bots/README.md
+# records the move. A new declaration may only TIGHTEN this file, never loosen it.
+#
+# MEASURED read-only on the demo login Exness-MT5Trial7 (206539306) on 2026-09-07:
+# balance 899.40 USD, equity 898.56, margin 0.88, margin_free 897.68, currency USD,
+# leverage 1:2000, margin_so_call 60 %, **margin_so_so 0.0** - this terminal reports NO
+# stop-out level, which is exactly the case `fallback_stop_out_pct` exists for. One position
+# carrying the retired legacy bot's magic 202500 was open at the time of the reading.
+# The earlier 10,000 USD figure (2026-09-05) is stale and was replaced rather than kept:
+# limits that describe a balance the account no longer has would halt every bot on the first
+# cycle. Nothing below comes from marketing material.
+#
+# RE-READ read-only 2026-09-08 (exness_usidx_sess phase 8, no order_send, MetaTrader5 5.0.6180,
+# terminal build 6182, connected=True): balance 894.24 USD, equity 896.97, margin 1.38,
+# margin_free 895.59, leverage 1:2000, margin_so_call 60 %, margin_so_so 0.0 (still no
+# stop-out level reported), positions_total 2 - BOTH carrying the retired legacy magic 202500,
+# up from one on 2026-09-07. `reference_equity: 900.0` and every limit below still describe
+# this account within 0.4 %, so nothing was changed. The two legacy positions are counted by
+# OpenExposureBreaker and by every bot's reconciliation step, which is why that breaker counts
+# EVERY magic and not just the bots'.
+#
+# WHAT THIS ACCOUNT CANNOT DO, measured the same day from `symbol_info` (US500m / USTECm):
+# `volume_min` is 0.14 lot on US500 and 0.05 on USTEC at `trade_contract_size` 1.0, i.e. the
+# SMALLEST placeable position is 0.14 x 7,716.56 = 1,080.32 USD and 0.05 x 29,659.06 =
+# 1,482.95 USD of notional - 1.20x and 1.65x the whole account equity. Margin at 1:2000 is
+# trivial (0.54 / 0.74 USD), so the terminal would accept it; the limits here would not, and
+# nor would exness_usidx_sess's own `capital_viability` check. Recorded here rather than only
+# in that bot because it is a property of the ACCOUNT: at 897 USD this login cannot fund an
+# index CFD position at all, whatever any bot's config says.
+
+account:
+  # The account these limits describe. `expected_login: null` means "do not check". Fill in
+  # 206539306 for the demo, or the real Pro login when that account is first read, so a bot
+  # pointed at the wrong login fails at startup instead of applying the wrong limits.
+  expected_login: null
+  currency: USD
+  # Equity the absolute floor is taken against. This is the balance the limits were written
+  # for, not a live reading: a floor that moves with equity is not a floor.
+  reference_equity: 900.0
+
+equity:
+  # Drawdown from the account's persisted high-water mark. 6 % = the strictest per-bot
+  # drawdown rule on this account (xau_fx_mt5). The high-water mark is stored next to the
+  # halt file and survives restarts, because a peak that resets with the process is not a peak.
+  max_drawdown_pct: 0.06
+  # Loss against the equity read at the start of the trading day. 2 % = the strictest per-bot
+  # daily rule on this account (xau_fx_mt5; exness_fx_d1 derives the same 2 %).
+  max_daily_equity_loss_pct: 0.02
+  # Absolute floor in account currency, below which nothing trades whatever the peak says.
+  # 0.80 x reference_equity: two full 6 % drawdowns and change; reaching it means the
+  # percentage breakers were cleared by hand more than once. It is also the level below which
+  # no bot on this login can place a 0.01-lot order at all (about 1,163 USD on EURUSD), so
+  # the floor and the granularity limit point the same way.
+  min_equity: 720.0
+
+margin:
+  # margin_level = equity / margin x 100 (percent), the terminal's own number. With no open
+  # position margin is 0 and the level is undefined; the breaker treats that as fine.
+  # 300 %: three times the margin the open book needs. Exness's margin call sits far lower;
+  # this is the level at which a new order should already be refused.
+  min_margin_level_pct: 300.0
+  # Multiple of the broker's own stop-out level (account_info().margin_so_so, percent) below
+  # which the account halts. 2.0: halt while there is still as much margin again between the
+  # book and a forced liquidation. A terminal that does not report the level falls back to
+  # `fallback_stop_out_pct` rather than reading a missing value as "infinitely far away".
+  stop_out_buffer_multiple: 2.0
+  fallback_stop_out_pct: 50.0
+
+exposure:
+  # Open positions and pending orders across EVERY magic, i.e. the five bots plus anything a
+  # person opened by hand. The bots' books together are at most about a dozen legs; more than
+  # this means something is not being closed.
+  max_open_positions: 20
+  max_open_orders: 20
+  # Gross notional of every open position in account currency (price_current x volume x
+  # contract size). 10 x reference_equity: the account's own leverage cap, far below the
+  # broker's 1:2000 and above any book the bots can build at this balance. Measured
+  # 2026-09-07 the account already carried 1,763.97 of gross notional from ONE legacy
+  # position, i.e. about 2x equity - which is why this cap counts every magic and not just
+  # the bots'.
+  max_gross_notional: 9000.0
+
+halt:
+  # Written when any account breaker trips; read by every bot's deployment loop before it
+  # stages an order. Relative paths resolve under ML4T_DATA_PATH/mt5/. Cleared only by a
+  # person (AccountGuard.clear_halt with a reason and a name).
+  path: monitor/account_halt.json
+  # Where the persisted high-water mark lives, same rules.
+  high_water_mark_path: monitor/account_hwm.json
+  # How long an account breaker stays OPEN before it probes HALF_OPEN, in hours. A day: the
+  # daily bots decide once a day, so a halt that cleared itself inside one cycle would never
+  # be seen by anyone.
+  recovery_timeout_hours: 24

@@ -1,0 +1,19 @@
+{
+  "config_name": "default_mse",
+  "family": "gbm",
+  "feature_sets": [
+    "financial",
+    "model_based"
+  ],
+  "label": "fwd_ret_5d",
+  "library": "lightgbm",
+  "n_folds": 8,
+  "seed": 42,
+  "max_iterations": 500,
+  "checkpoint_interval": 50,
+  "params": {
+    "objective": "regression",
+    "seed": 42,
+    "max_bin": 63
+  }
+}

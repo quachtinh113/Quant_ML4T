@@ -1,0 +1,484 @@
+strategy_id: exness_fx_d1
+setup_version: v1
+
+# Route B fork of case_studies/fx_pairs (bots/exness_fx_d1/BOT.md). Symbols are the *bare*
+# names; the Market Watch name (with any account suffix such as "m") is applied only inside
+# bots/_shared/mt5_loader.py through SYMBOL_MAP. Profiles: bots/assets/<SYMBOL>.md.
+universe:
+  symbols:
+    - AUDUSD
+    - EURUSD
+    - GBPUSD
+    - USDCAD
+    - USDJPY
+  n_assets: 5
+  # First server day on which every pair carries the full H4 grid (six bars a day). Before
+  # 2017-03-01 this account serves one H4 bar per day at 00:00 (D1 backfilled into H4:
+  # 2014-2016 have exactly one distinct bar hour), which the decision-bar rule cannot use.
+  # 01_feasibility_analysis and 02_labels start the sample here unless START_DATE overrides.
+  history_start: '2017-03-01'
+
+decision:
+  cadence: daily_ny_close
+  # Decision bar = the last MT5 H4 bar that CLOSES at or before the CME_FX session close
+  # (17:00 New York). On this server (UTC+0, H4 bars aligned to 00:00 UTC) that is the
+  # 16:00-20:00 UTC bar in both seasons, so the decision is taken at 20:00 UTC and the
+  # order goes at the 20:00 UTC bar open, inside the New York session. The original plan,
+  # the server D1 close, failed both feasibility checks on the real server on 2026-09-05
+  # (a short Sunday D1 bar puts two bars in the Monday session; the D1 close sits 120-180
+  # minutes after the calendar close): bots/exness_fx_d1/BOT.md, Decisions log. Candidate
+  # snapshots for the level-1 session backtest (one experiment each, one DSR trial each):
+  # h4_close_2000utc (this), london_open_0800utc, ny_open_1300utc.
+  snapshot: h4_close_2000utc
+  # Measured 2026-09-05 on server Exness-MT5Trial7 (demo): the server clock is UTC+0 all
+  # year (ServerClock.measure on BTCUSDm: offset 0; the FX week opens Sun 22:00 server in
+  # January and Sun 21:00 server in July, i.e. the server does NOT follow New York DST),
+  # so the D1 bar closes at 00:00 UTC = 20:00 New York in summer, 19:00 in winter, and a
+  # short Sunday D1 bar (21/22:00-24:00 UTC) exists. history_depth.json carries the same.
+  # The decision instant is the close of the 16:00-20:00 UTC H4 bar, all year (H4 bars are
+  # UTC-aligned on this server; the calendar close moves 21:00 <-> 22:00 UTC with New York
+  # DST, so the lag from the decision bar close to the calendar close is 60 or 120 min).
+  snapshot_utc: "20:00"
+  server_clock:
+    utc_offset_minutes: 0
+    measured_at: "2026-09-05T12:48:33+00:00"
+    follows_dst_of: null
+  # Largest distance (minutes) allowed between the decision bar's close and the CME_FX
+  # session close: one H4 bar, as in fx_pairs/01 ("within one four-hour bar of that
+  # close"). The stages refuse a decision bar that closes AFTER the calendar close, and a
+  # session whose last eligible bar closes further ahead than this (a server outage: on
+  # 2018-01-31 the 16:00 UTC bar is missing on every pair) is a day without a fresh price,
+  # dropped from the panel and reported, never decided on a stale bar.
+  session_close_tolerance_minutes: 240
+  execution_delay: next_bar_open
+  # The venue calendar that implements the 5PM rollover, and so the one that assigns a
+  # four-hour bar to the session it was printed in. Distinct from `evaluation.calendar`,
+  # which is the calendar the cross-validation splitter counts train and validation
+  # windows on. `02_labels` and `04_model_based_features` aggregate on this same value.
+  # Kept from fx_pairs on purpose: the server-day bar is checked against this calendar
+  # rather than replacing it (see bots/exness_fx_d1/BOT.md, decision "D1 vs 4h").
+  session_calendar: CME_FX
+
+# Engine-level execution defaults. Single source of truth — Ch16-19 notebooks
+# read these via get_backtest_config(); never declare a local INITIAL_CASH
+# or share_type constant. Changing values here invalidates every existing
+# backtest_hash for this case study (cash + share_type are spec-hash inputs).
+#
+# ``allocator_lookback`` is the bars-of-underlying-price window applied
+# uniformly to every moment-based allocator (inverse_vol, risk_parity, hrp,
+# mvo_ledoit_wolf). FX pairs has daily OANDA bars → 63 ≈ 3 months. Keeps
+# allocators comparable — MVO is not granted a longer covariance window than
+# IV by default.
+execution:
+  initial_cash: 100_000          # IBKR retail cohort default
+  # Generation 3 (2026-09-10, bots/exness_fx_d1/GEN3_DECLARATION_2026-09-10.md, user decision,
+  # OQ 32(b)): was `integer`. `mt5_lot` gates
+  # case_studies/utils/backtest_runner.py::_apply_lot_floor_if_declared -- every fill below the
+  # Exness 0.01-lot floor (see `sizing.min_lot_policy` and `costs.contract` below) is rounded
+  # down and DROPPED (weight -> 0.0), never bumped up. The engine's own share rounding still
+  # resolves to ShareType.INTEGER (case_studies/utils/backtest_presets.py translates `mt5_lot`
+  # for the engine; ml4t.backtest.ShareType has no lot member).
+  share_type: mt5_lot
+  allocator_lookback: 63         # 3 months of daily session closes aggregated from MT5 H4 bars
+
+mapping:
+  class: long_short_rank_rebalance
+  position_state_space: long_short
+  entry_logic: rank_by_momentum_or_carry
+  sizing: equal_weight
+
+costs:
+  class: material
+  components: [spread, commission, swap]
+  # Quoted spread in basis points of mid per crossing, measured 2026-09-05 from 30 days of
+  # COPY_TICKS_INFO ticks (2026-08-06 .. 2026-09-05, 0.5-1.3 M ticks per pair) on this
+  # demo account with bots/_shared/costs_mt5.py; table in ML4T_DATA_PATH/mt5/
+  # spreads_by_session.{parquet,json}. The stages charge the top of each range.
+  # In-session (asia / london / overlap / new_york / rollover +-15 min) p50 and p90 are
+  # within 0.02 bp of each other: EURUSD 0.69, USDJPY 0.63/0.64, GBPUSD 0.74, USDCAD
+  # 1.01/1.02, AUDUSD 1.26/1.28. The "other" bucket (the 21:00-22:00 UTC gap after the New
+  # York close and the edges of the week) is 0.63-4.82 p50 / 4.32-9.46 p90 and is NOT
+  # traded: execution is at the next bar open inside the New York session.
+  # cross_pairs is kept because the feasibility stage reads both keys; this universe has no
+  # cross, the template value is left in place.
+  spread_bps:
+    major_pairs: [0.6, 1.3]   # p50 0.63 (USDJPY) .. p90 1.28 (AUDUSD), in-session, measured 2026-09-05
+    cross_pairs: [3, 8]       # template value; no cross in this universe
+  spread_bps_by_session:      # measured [p50, p90] per bucket; 16_costs reads the p90 of the execution bucket
+    measured_on: "2026-09-05"
+    window_days: 30
+    EURUSD: {asia: [0.69, 0.69], london: [0.69, 0.69], overlap: [0.69, 0.69], new_york: [0.69, 0.69], rollover: [0.69, 0.69], other: [0.69, 4.34]}
+    GBPUSD: {asia: [0.74, 0.74], london: [0.74, 0.74], overlap: [0.74, 0.74], new_york: [0.74, 0.74], rollover: [0.74, 0.74], other: [2.44, 7.60]}
+    USDJPY: {asia: [0.63, 0.64], london: [0.63, 0.64], overlap: [0.63, 0.64], new_york: [0.63, 0.64], rollover: [0.63, 0.64], other: [0.63, 9.20]}
+    AUDUSD: {asia: [1.26, 1.28], london: [1.26, 1.28], overlap: [1.26, 1.27], new_york: [1.26, 1.28], rollover: [1.26, 1.27], other: [4.82, 9.46]}
+    USDCAD: {asia: [1.01, 1.02], london: [1.01, 1.02], overlap: [1.01, 1.02], new_york: [1.01, 1.02], rollover: [1.01, 1.02], other: [2.10, 4.32]}
+  # Mentor fleet gate, 2026-09-10, material item C(i): the account currency, declared once and
+  # read by case_studies/utils/backtest_runner.py::_apply_lot_floor_if_declared to classify every
+  # symbol as either base-is-account-currency (costs.contract.account_currency_is_base_for) or
+  # quote-is-account-currency (its own six-letter code's last three characters, checked against
+  # this value). A symbol that is neither -- a cross pair, e.g. EURJPY, not in this universe --
+  # RAISES rather than being sized under an unverified convention.
+  account_currency: USD
+  # Pro account (user decision 2026-09-05): no commission; costs are spread + swap.
+  commission_per_lot: 0   # Pro account
+  swap:
+    source: symbol_info   # swap_long / swap_short from history_depth.json, points per lot per night (swap_mode 1)
+    rollover3days: wednesday   # symbol_info.swap_rollover3days == 3 on all five pairs (2026-09-05)
+    measured_on: "2026-09-05"
+    # Read from symbol_info on the demo server Exness-MT5Trial7 on 2026-09-05: every pair
+    # reports swap_long = 0.0 and swap_short = 0.0 (swap_mode 1 = points). A demo can be
+    # swap-free where the real Pro account is not; re-read on the real account before
+    # 16_costs and treat a non-zero value as the cost, never this zero.
+    points_per_lot_per_night:
+      EURUSD: {long: 0.0, short: 0.0}
+      GBPUSD: {long: 0.0, short: 0.0}
+      USDJPY: {long: 0.0, short: 0.0}
+      AUDUSD: {long: 0.0, short: 0.0}
+      USDCAD: {long: 0.0, short: 0.0}
+    contract_size: 100000   # trade_contract_size on all five pairs; volume_min 0.01, volume_step 0.01
+  # Generation 3 (2026-09-10, OQ 32(b)): real numbers from bots/assets/*.md, verified against
+  # symbol_info on the demo login Exness-MT5Trial7 (2026-09-05/07; BOT.md "Contract facts").
+  # Gates case_studies/utils/backtest_runner.py::_apply_lot_floor_if_declared, which
+  # `execution.share_type: mt5_lot` (above) and `sizing.min_lot_policy` (below) together turn on.
+  contract:
+    contract_size: {default: 100000}
+    volume_min: 0.01
+    volume_step: 0.01
+    # The guard reads volume_max as ONE global scalar, not per symbol. Real values are 200 on
+    # EURUSD/GBPUSD/AUDUSD/USDCAD and 300 on USDJPY (bots/assets/USDJPY.md); 200, the tighter of
+    # the two, is declared so the ceiling this guard enforces is never looser than any pair's
+    # real one. At this bot's capital scale (a k=1 leg is a small fraction of one lot; the live
+    # side's own min_viable_allocated is 2,400 USD) no leg comes close to either ceiling, so this
+    # binds nothing today; recorded so a future reader does not read 200 as USDJPY's own number.
+    volume_max: 200.0
+    # OQ 30 / OQ 32(b): account currency is USD. EURUSD/GBPUSD/AUDUSD quote in USD, so the
+    # engine's own price-per-unit convention already matches a real MT5 lot for those three.
+    # USDJPY and USDCAD have USD as their BASE currency, so one unit of base currency already
+    # equals one account-currency dollar and must not be divided by price a second time -- the
+    # same correction bots/_shared/mt5_broker.py::unit_values already applies on the live path
+    # (Decisions log 2026-09-07), now applied in research sizing by
+    # case_studies/utils/backtest_runner.py::_apply_lot_floor_if_declared.
+    account_currency_is_base_for: [USDJPY, USDCAD]
+
+sizing:
+  # Generation 3 (2026-09-10, OQ 32(b), user decision): a fill below the Exness 0.01-lot floor is
+  # not tradeable and must not enter the equity curve. "reject" rounds a leg down to the lot grid
+  # and DROPS it (weight -> 0.0) when it rounds to zero; never bumped up to the floor, logged by
+  # the guard's own weight-zeroing (no separate log file). The same rule
+  # bots/exness_fx_d1/deploy/risk_config.yaml::execution.min_lot_policy already applies on the
+  # live (dry-run) path is now applied in research sizing too.
+  min_lot_policy: reject
+
+backtest:
+  rebalance:
+    # A rebalance is skipped when the per-asset weight change is below
+    # min_weight_change AND the resulting trade notional is below
+    # min_trade_value. The benchmark profile disables thresholds so that
+    # full-universe equal-weight (1/N per asset) rebalances at all.
+    default:
+      min_weight_change: 0.005
+      min_trade_value: 100.0
+    benchmark:
+      min_weight_change: 0.0
+      min_trade_value: 0.0
+  sweep:
+    # Iteration controls per stage. ``signal: 0`` means "all predictions";
+    # downstream stages take the top-N from the upstream stage's rank-1.
+    # Notebooks read these via get_top_n_predictions(case_study, stage).
+    top_n_predictions:
+      signal: 0                 # all signal predictions (eq-weight baseline)
+      allocation: 10            # top-10 model configs by equal-weight baseline Sharpe
+      cost_sensitivity: 1       # top-1 of {signal+allocation} per label
+      risk_overlay: 1           # top-1 of {signal+allocation} per label
+    # Skip MVO/HRP when allocator runtime is the bottleneck (intraday CSes).
+    expensive_allocators_skip: false
+    # All alternative allocators take the cheap path except the two moment-based
+    # methods covered by expensive_allocators_skip. Equal weight is the baseline
+    # and is intentionally absent here so the allocation stage cannot double-count it.
+    # Ch16 baseline selection. Long-short equal-weight top-k on all
+    # three label horizons; long-short is enforced at the backtest config
+    # level (allow_short_selling=true).
+    # Five instruments: top-1 and top-2 long-short are the only books that leave a
+    # cross-section to rank against (2 * max(top_k) = 4 <= 5 must quote each day).
+    top_k_grid:
+      fwd_ret_1d:  [1, 2]
+      fwd_ret_5d:  [1, 2]
+      fwd_ret_21d: [1, 2]
+    # Ch16 08 per-pair time-series framing (user decision 6, 2026-09-06), the second leg of the
+    # approved hypothesis: a pair is compared with its OWN trailing scores rather than with the
+    # other four on the same date, so two pairs can clear their threshold on the same session or
+    # neither can. Read by 13_backtest with SIGNAL_FAMILY: per_pair_timeseries and dispatched to
+    # signals.py::per_symbol_rolling_percentile_signal. Published as its own population,
+    # exness_fx_d1:timeseries-percentile-baselines, not as a generation of the equal-weight
+    # chain: a different `method` is a different strategy, not the same one answered twice.
+    timeseries_percentile_grid:
+      # ONE decision per session. signals.py defaults this to 390 (minute bars of a US equity
+      # session); at that value the window is lookback_days x 390 rows against 1,031 validation
+      # sessions, min_samples is never reached, every threshold is null and every book never
+      # trades while the sweep still completes. Measured with _diagnose_timeseries_signal.py on
+      # 2026-09-07: activation rate 0.0000 at 390 on every setting, 0.1938-0.2653 at 1.
+      bars_per_day: 1
+      # A pair is held when its own score is in its own top fifth: about one pair per session,
+      # the concentration of the top_k = 1 cross-sectional book.
+      long_q: 0.80
+      # A quarter and a year: execution.allocator_lookback is 63, and features.windows.zscore,
+      # dollar_exposure and gold_exposure are all 252. Two settings, so this family adds the
+      # same 1,068 trials each cross-sectional generation added and the three are comparable.
+      lookback_days: [63, 252]
+      # Long only, and this is the open-question-23 decision, declared before the sweep ran: the
+      # pinned config/backtest/base.yaml gives the engine a CASH account (allow_short_selling
+      # without allow_leverage), on which a top_k = 1 long-short target is one-legged on about a
+      # third of its sessions. A long-only book has gross <= 1 and net == gross, which the cash
+      # account holds exactly. A short_only pass would double what this family adds to K and
+      # needs the user's approval first. Exposure is measured per spec from portfolio_state and
+      # printed in the results table (_report_phase5.py), never assumed.
+      long_short: false
+      direction: long_only
+    # Ch17 portfolio: reuses top_k_grid above and sweeps over allocators.
+    # Moment-based allocators (IV/RP/HRP/MVO_LW) all use the CS-level
+    # ``execution.allocator_lookback`` — no per-allocator vol_window / lookback
+    # fields. No max-weight cap: each allocator expresses its natural
+    # concentration profile so the cross-method comparison is honest.
+    allocators:
+      - {name: score_weighted,  method: score_weighted}
+      - {name: inverse_vol,     method: inverse_vol}
+      - {name: risk_parity,     method: risk_parity}
+      - {name: mvo_ledoit_wolf, method: mvo_ledoit_wolf}
+      - {name: hrp,             method: hrp}
+      - {name: conformal_weighted, method: conformal_weighted}
+    # Ch18 cost sensitivity (bps; spread is the dominant cost component,
+    # captured here as combined commission + slippage in bps).
+    cost_grid_bps: [0, 1, 2, 3, 5, 7, 10, 15, 20, 30, 50]
+    # Ch19 risk overlays.
+    risk_controls:
+      position:
+        - {name: stop_loss_3pct,  type: stop_loss,     threshold: 0.03}
+        - {name: stop_loss_5pct,  type: stop_loss,     threshold: 0.05}
+        - {name: stop_loss_10pct, type: stop_loss,     threshold: 0.10}
+        - {name: stop_loss_15pct, type: stop_loss,     threshold: 0.15}
+        - {name: trailing_1pct,   type: trailing_stop, threshold: 0.01}
+        - {name: trailing_2pct,   type: trailing_stop, threshold: 0.02}
+        - {name: trailing_3pct,   type: trailing_stop, threshold: 0.03}
+        - {name: trailing_5pct,   type: trailing_stop, threshold: 0.05}
+        - {name: trailing_10pct,  type: trailing_stop, threshold: 0.10}
+        - {name: trailing_15pct,  type: trailing_stop, threshold: 0.15}
+        - {name: trailing_20pct,  type: trailing_stop, threshold: 0.20}
+        - {name: time_exit_10,    type: time_exit,     bars: 10}
+        - {name: time_exit_20,    type: time_exit,     bars: 20}
+        - {name: time_exit_40,    type: time_exit,     bars: 40}
+
+# The feature-specification register. ``03_financial_features`` binds every window
+# from here and renders ``families`` as the register table; nothing in that notebook
+# retypes a number this block declares. ``lookback`` is the longest chain of trailing
+# bars a family reads, counted from the decision timestamp, and it is the floor the
+# warmup audit holds each column to. ``lag`` is zero throughout: every input is a session
+# close aggregated from MT5 H4 bars, on the tape at the 20:00 UTC snapshot the decision is
+# taken at.
+features:
+  windows:
+    momentum: [5, 10, 21, 42, 63, 126, 252]
+    close_to_close_volatility: [21, 63]
+    garman_klass: [21, 63, 126, 252]
+    zscore: 252              # trailing window the multi-horizon returns are standardized against
+    zscore_horizons: [21, 63, 126]
+    channel: [21, 63, 126]
+    skip_recent: 21
+    drawdown: [63]
+    rsi: [14, 63]
+    moving_average: [21, 63, 252]
+    range: [21, 63]
+    bollinger: 21
+    dollar: [21, 63]         # horizons the dollar proxy is accumulated over
+    dollar_exposure: 252     # window each pair's correlation with the proxy is taken over
+    # Gold (XAUUSD, downloaded into the same MT5 parquet) on the same decision bar: the
+    # cross-instrument feature bots/assets/AUDUSD.md section 7 names (Ch08 03). Oil (WTI) is
+    # named by bots/assets/USDCAD.md but no oil instrument was downloaded, so it is absent.
+    gold: [21, 63]           # horizons the gold return is measured over
+    gold_exposure: 252       # window each pair's correlation with gold is taken over
+  ranked:
+    - ret_21d
+    - ret_63d
+    - ret_126d
+    - vol_gk_21d
+    - vol_gk_63d
+    - sharpe_21d
+    - sharpe_63d
+    - sharpe_126d
+  # Rows are kept from the bar this column can first hold a value, which is the
+  # longest chain in the matrix and the point past which every family is dense.
+  null_policy_carrier: zscore_126d
+  persistence_horizon: 63    # bars F6 reads the feature autocorrelation out to
+  # Rank correlation at which the redundancy tree is cut: two columns agreeing this
+  # closely on their ordering are one column as far as a linear model is concerned.
+  redundancy_cut: 0.7
+  families:
+    - name: momentum
+      pattern: ret_*d|mom_skip_recent|accel_*
+      role: signal
+      hypothesis: A pair that has moved keeps moving over the following session
+      inputs: daily close
+      lookback: 252
+      lag: 0
+      frame: time series
+      representation: simple return, and differences between horizons
+      failure_mode: reverses at the shortest horizons
+    - name: risk-adjusted momentum
+      pattern: sharpe_*d
+      role: signal
+      hypothesis: Trend earned with less dispersion repeats more reliably
+      inputs: daily log return
+      lookback: 252
+      lag: 0
+      frame: time series
+      representation: mean log return over its own dispersion, annualized
+      failure_mode: unbounded when dispersion approaches zero
+    - name: mean reversion
+      pattern: zscore_*|channel_pos_*|bollinger_pctb_*
+      role: signal
+      hypothesis: A pair stretched against its own recent range comes back
+      inputs: daily close
+      lookback: 378
+      lag: 0
+      frame: time series
+      representation: trailing z-score, position in the trailing range
+      failure_mode: a trending pair sits at the edge of its channel for months
+    - name: volatility
+      pattern: vol_gk_*|vol_cc_*|vol_ratio_*
+      role: state
+      hypothesis: Dispersion sets how far apart the cross-section can spread
+      inputs: daily OHLC
+      lookback: 252
+      lag: 0
+      frame: time series
+      representation: Garman-Klass and close-to-close deviation, and ratios of windows
+      failure_mode: lags a shock by roughly half its window
+    - name: range and drawdown
+      pattern: max_dd_*|avg_range_*
+      role: state
+      hypothesis: How far a pair sits below its peak conditions what a signal is worth
+      inputs: daily OHLC
+      lookback: 63
+      lag: 0
+      frame: time series
+      representation: share below the trailing peak, mean normalized daily range
+      failure_mode: says nothing about direction
+    - name: oscillator and trend
+      pattern: rsi_*|price_to_ma_*
+      role: signal
+      hypothesis: Price against its own recent path separates trend from exhaustion
+      inputs: daily close
+      lookback: 252
+      lag: 0
+      frame: time series
+      representation: Wilder-smoothed oscillator, ratio to a moving average
+      failure_mode: saturates in a sustained trend
+    - name: dollar factor
+      pattern: usd_factor_*|usd_corr_*
+      role: state
+      hypothesis: A broad dollar move is common to all five pairs and is not pair-specific
+      inputs: daily returns of the five USD pairs (every pair in this universe)
+      lookback: 315
+      lag: 0
+      frame: cross-asset
+      representation: signed average return, and each pair's rolling correlation with it
+      failure_mode: a signed average is not an estimated factor
+    - name: gold factor
+      pattern: gold_ret_*|gold_corr_*
+      role: state
+      hypothesis: The commodity currencies move with gold; a gold move is common to AUD and CAD and is not pair-specific
+      inputs: XAUUSD session close on the same decision bar, last print at or before it
+      lookback: 315
+      lag: 0
+      frame: cross-asset
+      representation: trailing gold return, and each pair's rolling correlation with it
+      failure_mode: gold keeps its own trading hours, so its close can be a stale print on a gold holiday
+    - name: cross-sectional position
+      pattern: rank_*
+      role: signal
+      hypothesis: Only relative standing is tradable in a long-short rank strategy
+      inputs: ret_21d, ret_63d, ret_126d, vol_gk_21d, vol_gk_63d, sharpe_21d, sharpe_63d, sharpe_126d
+      lookback: 252
+      lag: 0
+      frame: cross-section
+      representation: percentile within the decision date
+      failure_mode: discards the level the state families carry instead
+
+# Declared 2026-09-05 from history_depth.json (Exness-MT5Trial7, read the same day), before
+# any model was trained. The research bar is the MT5 H4 bar (decision block), and the full
+# H4 grid starts 2017-03-01 on every pair (universe.history_start; D1 and a one-bar-a-day
+# H4 backfill go back to 2014-01-14, H1 only to 2022-10-25). That leaves 8.5 years of
+# development history ahead of the holdout, of which the first ~1.5 years (378-bar feature
+# warmup, features.families mean reversion) are not dense, so the dense panel starts about
+# 2018-08. The fx_pairs geometry (8 folds x 5Y train + 1Y val) needs about 13 years and
+# 5Y windows would leave two folds; 3Y train + 1Y val with four folds uses 2018-09 ..
+# 2025-08 exactly: the oldest fold trains 2018-09 .. 2021-08 and validates 2021-09 ..
+# 2022-08. Four validation years is the most independent selection evidence this history
+# can give. The holdout is the final twelve months of history, 2025-09-01 .. 2026-08-31,
+# declared here and never moved; it is scored once by the holdout stages.
+# 01_feasibility_analysis checks that these folds fit.
+evaluation:
+  n_splits: 4
+  train_size: P3Y
+  val_size: P1Y
+  holdout_start: '2025-09-01'
+  holdout_end: '2026-08-31'
+  calendar: FX
+  periods_per_year: 252  # FX 5d/wk
+
+labels:
+  primary: fwd_ret_1d
+  buffer: 1D
+  variants:
+    - fwd_ret_5d
+    - fwd_ret_21d
+  variant_buffers:
+    fwd_ret_5d: 5D
+    fwd_ret_21d: 21D
+  # Vectorized-backtest thinning step per label: number of schedule slots
+  # to advance per trade so holding periods don't overlap.
+  rebalance_step:
+    fwd_ret_1d: 1
+    fwd_ret_5d: 5
+    fwd_ret_21d: 21
+
+modeling:
+  gbm:
+    libraries: [lightgbm]
+    preset: default
+    device: cpu
+    # LightGBM's own CPU default. 63 is the GPU default and was carried over with the
+    # device when these runs moved off the GPU, so every CPU fit was quantizing the design
+    # matrix into a quarter of the bins the library would have used. Coarser bins are
+    # faster and lose split points; the reader running this on a CPU gets what the
+    # documentation describes.
+    max_bin: 255
+
+causal:
+  treatment: mom_skip_recent
+  # Bars the treatment's own construction window spans, which is what the placebo block has
+  # to cover: permuting mom_skip_recent in blocks shorter than this destroys the serial
+  # dependence the refutation exists to preserve, and the resulting p-value reads like a
+  # refutation without being one. Declared here rather than inferred, because guessing which
+  # element of a window list a column was built from puts a wrong number behind a right-looking
+  # one. Derived from the construction, not chosen:
+  #
+  # `close.shift(skip_recent) / close.shift(momentum[-1]) - 1` in 03_financial_features,
+  # which is 21 and 252. Three different numbers live in that one expression and conflating them
+  # is easy, so all three are stated: the LOOKBACK is 252 sessions, the oldest price it reads;
+  # the RETURN INTERVAL is 231 sessions, from t-252 to t-21, which is what the value measures;
+  # and consecutive values OVERLAP in 230 of those 231. The declaration takes the lookback
+  # because it is the larger, so a block of this length spans the 231-session dependence
+  # whichever way the arithmetic is read.
+  treatment_window: 252
+  confounders: [vol_gk_21d, vol_gk_63d, zscore_21d]
+  method: walk_forward_dml
+  # Two things the register above cannot supply, and this is why the number is written here
+  # rather than derived. `features.windows.momentum` is a list of bar counts, not a
+  # suffix-keyed mapping, and `mom_skip_recent` is not built from any single element of it.
+  #
+  # And the block has to span this window, which is the reason it is declared at all. A block
+  # permutation keeps the treatment's serial dependence while breaking its alignment with the
+  # outcome; a block shorter than the construction window breaks the dependence too, which
+  # narrows the placebo distribution and makes the p-value read stronger than the evidence is.
+  # Sized from the label buffer alone this case study permuted a 252-session momentum column
+  # in blocks of 1, 5 and 21.

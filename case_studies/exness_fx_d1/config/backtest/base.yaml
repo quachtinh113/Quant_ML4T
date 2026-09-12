@@ -1,0 +1,45 @@
+account:
+  allow_short_selling: true
+  # Generation 3 (2026-09-10, bots/exness_fx_d1/GEN3_DECLARATION_2026-09-10.md, user decision,
+  # OQ 32(a)). Was: allow_short_selling alone, which ml4t.backtest.broker maps to
+  # account_type="crypto" (a CASH account: shorts allowed but sized off cash on hand, no margin
+  # -- OQ 23 measured 48% of the generation-2 winner's invested sessions one-legged, because a
+  # rotation's buy-back leaves no cash to fund the new short). allow_leverage=True maps to
+  # account_type="margin" (broker.py), so a k=1 or k=2 long-short target can hold both legs at
+  # once and the scored book is the dollar-neutral top-k book the design describes, not a
+  # cash-constrained approximation of it. Every registered backtest_hash moves under this change
+  # (strategy_spec["backtest_config"]["account"] is hashed, resolved_allow_short_selling reads
+  # it) -- generation 3, SUPERSEDES set in 13_backtest.py, K accumulates (declaration above).
+  allow_leverage: true
+  # Exness Pro leverage cap on this account is 1:2000 (bots/exness_fx_d1/BOT.md, Identity table,
+  # measured 2026-09-05 on the demo login Exness-MT5Trial7); initial_margin = 1 / 2000. Declared
+  # at the broker's real number, not loosened to "unconstrained": at this bot's own gross
+  # exposure (a k=1 long-short book is 2x gross, k=2 is the same 2x split two ways) the true
+  # margin requirement never approaches this cap, so the declaration binds nothing today but
+  # keeps a future wider sweep from silently exceeding what Exness would actually allow.
+  initial_margin: 0.0005
+  # long_maintenance_margin / short_maintenance_margin must be < initial_margin
+  # (ml4t.backtest.config.BacktestConfig.validate); the engine's Reg-T defaults (0.25 / 0.30
+  # against initial_margin 0.5, i.e. maintenance at 50% / 60% of initial) are scaled by the same
+  # ratio this bot's initial_margin is scaled by (0.0005 / 0.5 = 0.001), preserving "maintenance
+  # < initial, short tighter than long" without inventing a new ratio. Exness itself has no
+  # separate initial/maintenance tier (a single stop-out level instead, deploy/risk_config.yaml
+  # ::breakers), so this is the engine's own risk model scaled to the account's real cap, not a
+  # broker-quoted number.
+  long_maintenance_margin: 0.00025
+  short_maintenance_margin: 0.0003
+execution:
+  execution_price: open
+  execution_mode: next_bar
+commission:
+  model: percentage
+  rate: 0.0005
+slippage:
+  model: percentage
+  rate: 0.0002
+calendar:
+  calendar: FX
+  timezone: UTC
+  data_frequency: daily
+metadata:
+  case_study: exness_fx_d1

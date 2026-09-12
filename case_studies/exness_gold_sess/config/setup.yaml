@@ -1,0 +1,1034 @@
+strategy_id: exness_gold_sess
+# v1 -> v2 on 2026-09-10 (GEN2_DECLARATION_2026-09-10.md L0.1). Documentation only: read by no
+# code, enters no hash (grep 2026-09-10: 0 readers in case_studies/, utils/, scripts/, tests/,
+# bots/). The generation boundary is carried by population lineage and the Trials table.
+setup_version: v2
+
+# Route B fork of case_studies/exness_fx_d1 (itself a Route B fork of fx_pairs) for the bot
+# bots/exness_gold_sess/BOT.md. Written 2026-09-07 against the mentor specification
+# bots/exness_gold_sess/PHASE1_SPEC_MENTOR.md; every number below carries the measurement or
+# the file:line it came from. Nothing here was inferred from a model, a backtest or a fit.
+#
+# What is different from exness_fx_d1, in one line each:
+#   - the decision grid is a SESSION grid on H1 bars (two decisions a weekday), not a daily one;
+#   - two assets, so nothing is ranked cross-sectionally (features.ranked is empty by design);
+#   - costs are the metals class, measured on this account, not the FX class;
+#   - long feature windows are read from D1 bars and joined backward on the D1 bar's CLOSE.
+
+universe:
+  # Bare names; the Market Watch name (suffix "m" on this Exness account) is applied only
+  # inside bots/_shared/mt5_loader.py::SYMBOL_MAP. Convention fixed in
+  # bots/exness_fx_d1/BOT.md:95 so an account-type change does not re-hash every label.
+  symbols:
+    - XAGUSD
+    - XAUUSD
+  n_assets: 2
+  # MEASURED 2026-09-07 (task B0, bots/exness_gold_sess/tools/deepen_metals_h1.py): the first
+  # week from which the H1 grid is dense on BOTH metals, by the min_bars_per_week=100 rule of
+  # experiments/xau_fx_mt5/data/build_panel.py:789 (dense_history_start). Before this week the
+  # server serves 6 H1 bars a week on both symbols - a D1 backfill on the H1 timeframe, not an
+  # hourly grid (XAUUSD 971 such bars from 2014-01-14, XAGUSD 976 from 2014-01-12); at
+  # 2017-02-27 both jump to 113-120 bars a week. Depth: XAUUSD 56,123 dense bars, XAGUSD
+  # 56,103, both to 2026-09-04. The "2022-10-25" in history_depth.json before B0 was the
+  # terminal's chart cache, not the account: bots/assets/XAUUSD.md section 12c.
+  history_start: '2017-02-27'
+
+decision:
+  # Read by case_studies/utils/backtest_loaders.py:2172-2177 (entry_cadence > cadence >
+  # bar_frequency). "session" says the schedule is the session grid this file declares, not a
+  # calendar frequency the engine knows about.
+  #
+  # UNCHANGED when the price grid became H1 (PRICE_GRID_DECLARATION.md section 2, row 1), and
+  # deliberately so. The cadence resolves on PREDICTION timestamps, never on prices
+  # (backtest_loaders.py:1408, 1580-1581); "session" does not parse as an intraday cadence
+  # (_intraday_cadence_interval, :1323-1336), so resolve_decision_schedule returns every
+  # decision instant - which is exactly right. NEVER replace it with an hour token: with
+  # `1_hour` and step 2, _on_the_clock keeps 14:00 (50400 % 7200 == 0) and DROPS 09:00
+  # (32400 % 7200 == 3600), so the entire London book would disappear in silence.
+  cadence: session
+  # NEW KEY, PRICE_GRID_DECLARATION.md section 2 row `decision.slots_per_year`, 2026-09-08.
+  # 2 snapshots x 252 trading days = 504. This is where 504 belongs: SLOT-LEVEL statistics -
+  # N, N_eff, IC, the training-data floor - as opposed to the ANNUALISATION of the engine's
+  # return series, which is a daily grid and is `evaluation.periods_per_year: 252` below.
+  # `04_model_based_features.py` reads this key (it used to read evaluation.periods_per_year,
+  # whose value was also 504, so the switch is a no-op on that stage's digest and was asserted
+  # to be: 4b1a0239330a0e7d before and after). The 24-hour book trades a subset of these slots,
+  # 252 x 4/5 x 2 = 403.2 a year, which is a trade census and not an annualisation factor.
+  slots_per_year: 504
+  # A RULE, not a clock time; documentation only (grep -rn "snapshot" case_studies/utils/
+  # utils/ = 0 hits, so no shared module reads it). The stages of this case study read
+  # `snapshots` below.
+  snapshot: session_open_plus_1h
+  # The two decision points, defined by the VENUE's local session, never by a UTC hour. The
+  # venue windows live in bots/_shared/sessions.py:276-282 as ZoneInfo windows (london 08:00-
+  # 17:00 Europe/London, new_york 08:00-17:00 America/New_York), so daylight saving is handled
+  # by the zone database and the UTC hour moves with the season on its own. The server clock is
+  # UTC+0 all year and does NOT follow New York DST (measured, below), which is why hard-coding
+  # a server hour would be wrong in one of the two seasons.
+  # bot-portfolio-exness.md:59: "Dinh nghia theo UTC, DST xu ly bang thu vien mui gio... Khong
+  # hard-code gio server."
+  snapshots:
+    london: {venue_session: london, offset_minutes: 60}
+    ny: {venue_session: new_york, offset_minutes: 60}
+  # bots/_shared/sessions.py:64 EDGE_MINUTES = 30, the flag `edge_open` at sessions.py:332-334.
+  # The decision is the close of the first H1 bar whose close is at or after open + 30 minutes;
+  # on a UTC-aligned H1 grid that is always open + 60 minutes, which is why `offset_minutes` is
+  # 60 and why 01_feasibility_analysis asserts the identity rather than assuming it.
+  edge_block_minutes: 30
+  execution_delay: next_bar_open
+  # One H1 bar. A session whose label endpoint is further than this from the declared session
+  # close had no fresh price there (an early close, a holiday, an outage): it is DROPPED and
+  # reported, never priced on a stale bar. Rule inherited from exness_fx_d1/setup.yaml:46-51
+  # (the 2018-01-31 incident).
+  session_close_tolerance_minutes: 60
+  # Share of declared sessions that may fail to resolve to a decision and an endpoint exactly
+  # eight bars apart before the panel is refused. MEASURED 2026-09-07 over 2017-02-27 ..
+  # 2026-08-31: 4,962 declared sessions, of which XAUUSD drops 91 (1.85 %) and XAGUSD 95
+  # (1.94 %). Almost all of them are US public holidays on which the metals quote but stop three
+  # to five hours before New York's 17:00 (July 4, Labor Day, Thanksgiving, Christmas Eve), plus
+  # 8-14 New York sessions whose last hour has no bar. The venue windows here come from a
+  # weekday rule, not from an exchange holiday calendar, so those sessions are DECLARED and then
+  # dropped; `exness_fx_d1` never sees them because CME_FX excludes them before the count.
+  # A separate and much tighter limit (0.5 %, `_features.decision_grid`) applies to a STALE
+  # DECISION - no fresh bar at the snapshot itself - which is an outage and not a holiday:
+  # measured, 2 sessions per metal, 0.04 %.
+  max_dropped_session_share: 0.03
+  # NOT CME_FX. exness_fx_d1 keeps CME_FX because its decision is the 17:00 New York rollover
+  # (setup.yaml:54-60); this bot decides INSIDE a session and its session boundaries come from
+  # the venue zones above, not from an exchange calendar. The name records the rule; no code
+  # passes it to TradingCalendar. Precedent for a named non-exchange calendar:
+  # case_studies/xau_fx_mt5/config/setup.yaml:58 (mt5_24x5_utc).
+  # `evaluation.calendar` below stays FX: that is the calendar utils/cv_splits counts the
+  # train/validation windows on, a different question.
+  session_calendar: metals_globex_utc
+  # GENERATION 2, BLOCK 1 (GEN2_DECLARATION_2026-09-10.md section 1), 2026-09-10. Documentation
+  # of the bot-local closure calendar; no stage of this case study reads it, so it enters no
+  # hash. The file is written only by bots/exness_gold_sess/tools/build_closure_calendar.py and
+  # read through _features.declared_closures. Two sources, no hand-typed date: the repository's
+  # pinned calendar package (exchange_calendars - the fold ladder's own id, evaluation.calendar
+  # FX -> CME_FX, is a pandas_market_calendars name the package does not know, so the same-house
+  # id CMES was chosen by the printed criterion of the tool: fewest closures the tape contradicts)
+  # and the development tape (decision_grid's unresolved_dates and the census Mon-Fri holes).
+  # `tape_wins_for_history`: for a past date the tape is the truth and a package row it
+  # contradicts is printed, not filtered; for a future date only the package can speak.
+  closure_calendar:
+    path: bots/exness_gold_sess/calendar/closures_metals.parquet
+    source: exchange_calendars
+    source_calendar_id: CMES
+    source_version: 4.13.2
+    reconciled_on: 2026-09-10
+    # Amendment 1 (GEN2_DECLARATION_2026-09-10.md, "Tu chinh 1"): the close_utc of a tape row
+    # is the last bar AT OR BEFORE the New York venue close of the date (was max(bar_close),
+    # which took the Globex re-open bar on 104 of 159 rows). Digest fb0833fb21c03673 ->
+    # e831fb7f48b49235, 421 rows, 2026-09-10. Consumers that must not learn a closure from the
+    # tape (block 5's early-close filter, breaker (g)) read
+    # declared_closures(package_only=True, kinds=["early_close"]); the tape rows are for
+    # reconciliation and printing only.
+    content_digest: e831fb7f48b49235
+    tape_wins_for_history: true
+  # Buckets no order is ever placed in. `rollover` = +-15 min around server midnight
+  # (sessions.py rollover_flag). `other` is EMPTY on both metals on this account (measured
+  # 2026-09-07, bots/assets/XAUUSD.md section 12b: the metals stop quoting during the daily
+  # 21:00-22:00 UTC break and Sydney opens at 22:00 UTC in AEST, so every tick outside the
+  # named sessions is already in `asia`); it is declared anyway so a change of account cannot
+  # open an unpriced bucket silently.
+  no_trade_buckets: [rollover, other]
+  # The values SESSION_FILTER may take in 13_backtest, plus the pooled book. `overlap` is NOT
+  # here: with these two snapshots the overlap window (13:00-17:00 UTC winter,
+  # bots/assets/XAUUSD.md:79) contains the New York decision and not the London one, so a
+  # filter on `overlap` selects exactly the rows `ny` selects. A duplicate spec is a wasted
+  # trial in the DSR (bot-portfolio-exness.md:96); dropped on the mentor's item 1.1c.
+  session_filter_values: [london, ny]
+  # MEASURED. ServerClock.measure on BTCUSDm, 2026-09-07 16:16:32 UTC, login 206539306 @
+  # Exness-MT5Trial7: offset 0 minutes, re-measured and unchanged from 2026-09-05
+  # (bots/assets/XAUUSD.md section 12). The server does not follow New York DST; the sessions
+  # above do follow their venues' DST, which is the whole reason they are declared as venues.
+  server_clock:
+    utc_offset_minutes: 0
+    measured_at: "2026-09-07T16:16:32+00:00"
+    follows_dst_of: null
+
+# Engine-level execution defaults; the single source of truth every Ch16-19 stage reads
+# through get_backtest_config(). Changing a value here invalidates every existing
+# backtest_hash for this case study.
+execution:
+  initial_cash: 100_000          # same retail cohort default as every other case study
+  # units = lots x trade_contract_size = OUNCES. XAUUSD volume_min 0.01 x 100 = 1 oz, so any
+  # integer is placeable; XAGUSD 0.01 x 5000 = 50 oz, so only multiples of 50 are. The engine
+  # does not know that: the 50 oz grain is checked in bots/exness_gold_sess/tests/
+  # test_parity.py and priced in 16_costs (PHASE1_SPEC_MENTOR.md section 2.e item 5).
+  share_type: integer
+  # 126 -> 1512 on 2026-09-08, PRICE_GRID_DECLARATION.md section 2. The unit is ROWS OF THE
+  # PRICE FRAME, because that is what the allocator reads (backtest_runner.py:2187-2265,
+  # _apply_allocation(prices=...)), and the price frame is now the H1 grid rather than the
+  # decision panel. 63 trading days x 24 bars = 1,512 - the same three months
+  # exness_fx_d1 expresses as 63 daily rows (setup.yaml:75) and xau_fx_mt5 as 1512 H1 rows
+  # (setup.yaml:73). Measured density on this account is 115-120 bars a week (~23.5 a day), so
+  # 1,512 bars is ~64 calendar-trading days, under a day away from the 63 intended.
+  # Footnote, and it is a read-too-much rather than a read-too-little: the shared table
+  # _CADENCE_CALENDAR_DAYS_PER_PERIOD has no token `session`, so _calendar_days_per_period
+  # falls back to 1.5 days per period (backtest_loaders.py:1237-1239) and the warmup prefix
+  # becomes ceil(1512 x 1.5) = 2,268 calendar days. That table is shared with other case
+  # studies whose run logs are NOT empty and is deliberately left alone.
+  # This key DOES enter the backtest hash (research/strategy.py:304-306), so changing it later
+  # only creates a new identity - it cannot rewrite a registered one.
+  allocator_lookback: 1512
+
+mapping:
+  # NOT long_short_rank_rebalance. Two assets do not make a cross-section: a percentile over
+  # two names takes two values, and the 8 rank_* columns exness_fx_d1 carries were already
+  # STOPped there for staleness on five names (bots/exness_fx_d1/BOT.md:81).
+  # PHASE1_SPEC_MENTOR.md section 2.d.
+  class: per_asset_signal_timing
+  # backtest_loaders.py:2167-2169 splits this string into tokens and reads long_short from the
+  # presence of both "long" and "short"; the wording is load-bearing, not decorative.
+  position_state_space: long_short
+  entry_logic: per_symbol_threshold_on_predicted_return
+  sizing: fixed_fraction
+
+costs:
+  class: material
+  components: [spread, commission, swap]
+  # MEASURED 2026-09-07 on this account from 30 days of COPY_TICKS_INFO ticks (window
+  # 2026-08-08 15:50 -> 2026-09-07 15:50 UTC) through bots/_shared/costs_mt5.py::measure_spreads,
+  # the same call and the same six session buckets the five FX pairs were measured with:
+  # 6,411,481 ticks XAUUSD, 1,559,623 ticks XAGUSD. Table:
+  # ML4T_DATA_PATH/mt5/spreads_by_session.{json,parquet}; write-up bots/assets/XAUUSD.md 12b
+  # and bots/assets/XAGUSD.md 12b.
+  #
+  # The quoted spread is a CONSTANT in points on this Pro account - 260 points (0.260 USD) on
+  # gold and 30 points (0.030 USD) on silver - in every bucket and at every percentile of the
+  # 30-day window. The bps figures move only because the price level does.
+  #
+  # Range convention (inherited from fx_pairs and exness_fx_d1): [lowest p50 in the universe,
+  # highest p90 in the universe] PER CROSSING; 01_feasibility_analysis and
+  # backtest_loaders::_normalize_cfd_costs charge the top of the range. Here that is
+  # XAUUSD p50 0.58 .. XAGUSD p90 4.70, so the whole book is charged silver's p90. That is
+  # deliberately conservative and is what PHASE1_SPEC_MENTOR.md section 2.e asks for; the
+  # per-symbol truth is in spread_bps_by_session below and is what 16_costs prices with.
+  #
+  # `metals` is a NEW pair class added to case_studies/utils/backtest_loaders.py::
+  # _cfd_pair_class in this task. Before it, that function returned "major_pairs" for any
+  # symbol containing "USD" - which XAUUSD and XAGUSD both do - so a metals-only block would
+  # have raised, and an FX-numbered major_pairs block would have priced gold at 1.3 bps in
+  # silence. No `major_pairs` key is declared here: this universe has no FX pair, and keeping
+  # a placeholder FX range would be a wrong number one edit away from being used.
+  spread_bps:
+    metals: [0.58, 4.70]
+  # NOT declared: spread_bps_provisional. The mentor spec (section 2.e) carried that guard for
+  # as long as XAGUSD had never been measured on this account. It has been, on 2026-09-07, from
+  # 1.56 M ticks over the same 30-day window as gold, so the flag would be a permanently false
+  # guard - and a guard that is always false trains the reader to ignore it. What remains open
+  # is the REAL Pro account (this is the demo login 206539306), and that is carried where it
+  # belongs: `measured_on_account: demo` below, plus the kill criterion in
+  # bots/exness_gold_sess/BOT.md and the phase-6 gate.
+  spread_bps_by_session:
+    # WHERE the number comes from, declared so the alternative is refused explicitly. `ticks` =
+    # bots/_shared/costs_mt5.measure_spreads over COPY_TICKS_INFO. The alternative on this
+    # account is the per-bar `spread` field, and it must NOT be used without filling first:
+    # 1,081 XAUUSD and 1,074 XAGUSD H1 bars up to 2023-02-03 quote spread == 0 (measured
+    # 2026-09-08, bots/exness_gold_sess/data_census_2026-09-08.md section 1d), so reading that
+    # field would price most of 2017 as a free crossing. Asserted in
+    # bots/exness_gold_sess/tests/test_data_quality.py.
+    source: ticks
+    measured_on: "2026-09-07"
+    measured_on_account: demo        # login 206539306 @ Exness-MT5Trial7, trade_mode 0
+    window_days: 30
+    window_utc: ["2026-08-08T15:50", "2026-09-07T15:50"]
+    # [p50, p90] bps of mid, per crossing. `other` is empty on both metals (no ticks), so no
+    # range is quoted for it and no order may be placed there (decision.no_trade_buckets).
+    XAUUSD: {asia: [0.59, 0.60], london: [0.59, 0.60], overlap: [0.59, 0.60], new_york: [0.58, 0.60], rollover: [0.58, 0.60]}
+    XAGUSD: {asia: [4.53, 4.66], london: [4.54, 4.70], overlap: [4.52, 4.64], new_york: [4.53, 4.67], rollover: [4.53, 4.65]}
+    # Round trip at the p90 of the traded sessions: XAUUSD 2 x 0.60 = 1.2 bps,
+    # XAGUSD 2 x 4.70 = 9.4 bps. Silver is 7.7x gold in bps.
+    round_trip_p90_bps: {XAUUSD: 1.2, XAGUSD: 9.4}
+  commission_per_lot: 0   # Exness Pro account, user decision 2026-09-05 (BOT.md:15)
+  swap:
+    source: symbol_info
+    mode: points                     # swap_mode 1 = points per lot per night
+    rollover_utc: "00:00"            # server midnight; the server is UTC+0
+    rollover3days: wednesday         # symbol_info.swap_rollover3days == 3 on both metals
+    measured_on: "2026-09-07"
+    measured_on_account: demo
+    # Re-read 2026-09-07 on the demo: both metals report swap_long = swap_short = 0.0. A demo
+    # can be swap-free where the real Pro account is not. The swap is deliberately NOT part of
+    # any label (PHASE1_SPEC_MENTOR.md section 2.c): it is a holding cost per night, not a
+    # per-crossing cost the percentage engine can express (backtest_loaders.py:2283-2285), and
+    # folding it into a label would make every label hash depend on the account type. It is
+    # priced in 16_costs, after a read on the real account.
+    points_per_lot_per_night:
+      XAUUSD: {long: 0.0, short: 0.0}
+      XAGUSD: {long: 0.0, short: 0.0}
+  # symbol_info, read 2026-09-07 (bots/assets/XAUUSD.md 12/12b, XAGUSD.md 12/12b).
+  contract:
+    contract_size: {XAUUSD: 100, XAGUSD: 5000}
+    volume_min: 0.01
+    volume_step: 0.01
+    volume_max: 200.0
+    digits: {XAUUSD: 3, XAGUSD: 3}
+    point: {XAUUSD: 0.001, XAGUSD: 0.001}
+    # units = lots x contract_size; the smallest placeable order in engine units
+    min_units: {XAUUSD: 1, XAGUSD: 50}
+
+backtest:
+  # ---------------------------------------------------------------------------------------
+  # RESOLVED 2026-09-08 by bots/exness_gold_sess/PRICE_GRID_DECLARATION.md, with run_log/ still
+  # EMPTY, so this is authoring and not revision. The blocking prerequisite recorded here on the
+  # morning of 2026-09-08 (the session panel registered as the price grid, which can express
+  # only a 5-hour London hold and a 19-hour New York one against an 8-hour label) is now fixed,
+  # and it is fixed by TWO changes, not one:
+  #
+  #   1. THE GRID. _PRICE_CONFIG["exness_gold_sess"] now names the loader
+  #      "exness_gold_sess_h1": the raw MT5 H1 bars of both metals, keyed on the BAR CLOSE
+  #      (timestamp + 60 min, the convention every decision instant of this bot already
+  #      follows), with NO session cropping. Every decision instant is therefore a row of the
+  #      grid - a subset, so predictions stay at session cadence and need no as-of join - and
+  #      the bars between entry and exit are there for the Ch19 stop and trailing rules to read.
+  #      Not trading outside a session is guaranteed by the rebalance schedule, which is built
+  #      from PREDICTION timestamps (backtest_runner.py:1408-1410), never by deleting bars.
+  #
+  #   2. THE HOLD. It is NOT the grid spacing and NOT slot_strategy. slot_strategy expresses an
+  #      exit by ceasing to emit a weight row, and the engine only acts at
+  #      `timestamp in rebalance_schedule`, which is a subset of the prediction timestamps -
+  #      this bot has no prediction at 17:00, so the exit would never be executed (that is why
+  #      nasdaq100_microstructure can use it: its prediction panel is 15 minutes dense). It also
+  #      refuses long_short (slot_strategy.py:277-281) while mapping.position_state_space is
+  #      long_short. The mechanism that DOES fire away from a decision instant is a broker-level
+  #      position rule: TimeExit(max_bars=N), set once on the first bar
+  #      (backtest_runner.py:1473-1476) and evaluated on the position's own bars_held. So every
+  #      13_backtest spec - the Ch16 baselines too, not only the Ch19 risk arms - carries
+  #      risk={"position_rules": [{"type": "time_exit", "bars": HOLD_BARS}]}, which puts the
+  #      hold inside the backtest hash instead of leaving it an implicit default.
+  #
+  # Metric warning that follows from (2), stated rather than discovered later: a rule exit does
+  # not pass through the weight series, so the registry's avg_turnover (computed from weights,
+  # backtest_runner.py:1610-1620) UNDER-REPORTS by roughly half. Honest turnover is read from
+  # fills.parquet / trades.parquet (registry/registration.py:1378-1383). 16_costs is unaffected:
+  # it re-runs the engine over cost_grid_bps and the engine charges on real fills.
+  # Flipped to true on 2026-09-08 AFTER bots/exness_gold_sess/tests/test_backtest_grid.py went
+  # green, not before, and it STAYS true after the New York exit was fixed on the same day: the
+  # grid does express the 8-bar horizon. What it claims, and what that test file measures on real
+  # fills of a register=False backtest: the grid is hourly and keyed on the bar close (every
+  # decision instant is a grid row), and the realised hold is the DERIVED number of price-grid
+  # bars on 100 % of positions in both books.
+  price_grid_expresses_primary_label: true
+  price_grid_fix: register_h1_close_keyed_grid_and_hold_with_position_time_exit
+  # ---------------------------------------------------------------------------------------
+  # THE RESIDUAL, declared because the bot would otherwise be claiming a parity it does not have
+  # (bots/exness_gold_sess/NY_EXIT_DECLARATION.md section 2). Documentation only: no stage reads
+  # it to compute anything, it enters no hash - but 13_backtest ASSERTS the grid still measures
+  # these numbers before it plans a single backtest, so it cannot rot into a false claim.
+  #
+  # What it says: the exit fill instant of a position is the LATEST grid fill instant at or before
+  # the sealed label_end_ts, and this is how far short of the endpoint that lands.
+  #   london 0  - the exit fills exactly on the endpoint, 8 bars, 480 clock minutes;
+  #   ny     60 - one grid bar short, 7 bars, 420 clock minutes. The New York book therefore
+  #               TRAINS ON AN 8-HOUR LABEL AND TRADES A 7-HOUR WINDOW. The shortfall is inside
+  #               the label window, in the same direction, on 100 % of rows, and it is the only
+  #               deviation available: the New York session close IS the start of the broker's
+  #               daily one-hour break in both seasons (both anchored on 17:00 America/New_York),
+  #               so the grid row that would fill at the endpoint does not exist. An 8-bar hold
+  #               would fill at the first print AFTER the break - 60 minutes late on a weekday and
+  #               Sunday 22:00 UTC after a Friday - which is kill criterion (g) of this bot firing
+  #               on 100 % of New York positions by design.
+  #
+  # Fill instants live on a 60-minute lattice, so the only values reachable at or before the
+  # endpoint are 0, 60, 120 ... The pass band is therefore "at most one grid bar", which resolves
+  # the one internal discrepancy in the declaration (section 1.4 writes "< 60" while section 2
+  # publishes 60); _hold.py::exit_gap_minutes_by_book records the resolution and asserts it.
+  #
+  # CONSEQUENCE FOR PHASE 6, declared now so it cannot be discovered later: the IC is measured on
+  # an 8-hour label and the P&L is earned over a 7-hour window on the New York rows. That join has
+  # to be MEASURED in phase 6 - corr(fwd_ret_7h_probe, fwd_ret_8h) and the IC of the same
+  # predictions on the 7-hour probe, New York rows only - and REPORTED. It is a diagnostic, not a
+  # surface to select on: no model may be chosen by it. If the IC degrades materially the honest
+  # answer is to re-seal the New York label at a tradable horizon, which moves the digests and is
+  # a new identity, declared in advance.
+  exit_gap_minutes_by_book:
+    # `by_book` stays: it is the truth about the tape against the venue's session close, and
+    # it is what generation 1 traded against (fwd_ret_8h). Generation 2 seals the primary label
+    # at the tradable exit itself, so against fwd_ret_sess the gap is 0 in BOTH books by
+    # construction (GEN2_DECLARATION_2026-09-10.md section 2; asserted on 100 % of the rows the
+    # folds reach by tests/test_labels_gen2.py::test_the_tradable_exit_reproduces_the_derived_hold).
+    by_book: {london: 0, ny: 60}
+    against_fwd_ret_sess: {london: 0, ny: 0}
+    derivation: last_grid_fill_at_or_before_label_end
+    measured_on: '2026-09-08'
+    measured_over: 3612 london + 3475 ny sealed endpoints, both metals, both seasons, folds 0-3
+  rebalance:
+    default:
+      min_weight_change: 0.005
+      min_trade_value: 100.0
+    benchmark:
+      min_weight_change: 0.0
+      min_trade_value: 0.0
+  sweep:
+    top_n_predictions:
+      signal: 0                 # all signal predictions (the equal-weight baseline population)
+      allocation: 10
+      cost_sensitivity: 1
+      risk_overlay: 1
+    expensive_allocators_skip: false
+    # The books 13_backtest runs. Declared BEFORE any prediction exists so the trial count K
+    # is known in advance: K = |session_books| x sum over labels of (|prediction sets| x
+    # |signal_specs|). PHASE1_SPEC_MENTOR.md section 2.d caps this deliberately - with the
+    # untouched fx_pairs menu (178 prediction sets a label) and 3 labels, three books and two
+    # signal specs already give K ~ 3,204, and exness_fx_d1 found 0 of 1,068 specs significant
+    # in each of its three cohorts at the cumulative K = 3,204 (bots/exness_fx_d1/BOT.md:83).
+    # (This comment read "K = 2,136" until 2026-09-09 - the count before fx_d1's third cohort
+    # of 2026-09-07; it is a comment, not a value, so no hash moves.) Every extra sweep dimension raises the bar
+    # it has to clear itself.
+    # [london, ny, both] -> [london, ny] on 2026-09-08, PRICE_GRID_DECLARATION.md section 3.4.
+    # `both` is no longer an ENGINE book, because the broker holds ONE NET POSITION PER SYMBOL:
+    # on a pooled book a New York order at 14:00 lands in the middle of a London hold, so the
+    # position is adjusted rather than opened, bars_held keeps counting from the London entry,
+    # and TimeExit closes the WHOLE position at 17:00 - killing the New York leg after 3 hours
+    # instead of 8. Nothing in this repository can express two overlapping holds of one symbol
+    # on one net account, slot_strategy included (slot_strategy.py:272-275).
+    session_books: [london, ny]
+    # So the pooled book is produced ARITHMETICALLY, not by a third engine run: a deterministic
+    # 50/50 sum of the two registered return series, built in 19_strategy_analysis. It is exact
+    # (each sleeve really does hold 8 bars), conservative on cost (when the sleeves point in
+    # opposite directions the sum pays two spreads where a net book would cancel - erring
+    # expensive, the right direction for a bot being tested against a breakeven gate) and it
+    # leaves execution_delay: next_bar_open untouched. It stays ONE spec per
+    # (label x prediction x signal), so K does not change; sweeping the sleeve weights (0.3/0.7
+    # and so on) WOULD add trials and is not declared.
+    pooled_book:
+      method: sleeve_sum
+      weights: {london: 0.5, ny: 0.5}
+      produced_in: 19_strategy_analysis
+    # `session_filter` is put into the `signal` dict that reaches build_backtest_spec, so each
+    # book gets its own backtest_hash (case_studies/research/strategy.py:353-359 ->
+    # backtest_presets.py:457-462 -> execution.py:285-291). MECHANICAL WARNING, and it is the
+    # easiest thing to get wrong here: build_target_weights_from_config dispatches on
+    # config["method"] and IGNORES unknown keys (case_studies/utils/signals.py:537-560), so
+    # adding the key without also filtering the prediction rows produces three different
+    # hashes and three identical results - "a new hash is a cache key, not proof an override
+    # reached the model" (.claude/skills/ml4t/references/case-studies.md:130-131). The row
+    # filtering is therefore real and it happens before weights are built:
+    # backtest_runner::apply_session_filter, called from run_backtest immediately after
+    # apply_universe_filter and driven purely by strategy.signal.session_filter - the same
+    # shape sp500_options' universe_filter uses, so every path (the sweep, 16_costs, the
+    # holdout producer) filters identically. 13_backtest asserts the london and ny row sets are
+    # non-empty and disjoint before it plans anything, and
+    # bots/exness_gold_sess/tests/test_backtest_grid.py asserts the two books' realised holds.
+    signal_specs:
+      # <= 2 per label (spec section 2.d). equal_weight_top_k is meaningless on two assets
+      # (top-1 = "whichever scores higher", top-2 = "buy both"), so neither variant is here.
+      - {name: fixed_threshold_0, method: fixed_threshold, threshold: 0.0}
+      # bars_per_day 2 -> 1 on 2026-09-08 (NY_EXIT_DECLARATION.md section 4.b), on an empty
+      # run_log/, and it is a DEFECT FIX rather than a preference - one spec, one value, fixed
+      # before the sweep, by derivation.
+      #   What the key counts: signals.py:377 computes W = int(lookback_days * bars_per_day) over
+      #   ROWS OF THE PREDICTION FRAME, PER SYMBOL. apply_session_filter runs at
+      #   backtest_runner.py:1162, BEFORE any weight is built, so inside every engine book each
+      #   symbol has exactly ONE row a day. At 2 the rolling window was 126 rows = about 126
+      #   trading days ~ six months, against a declared intent of 63, and the warmup
+      #   min_samples = W // 2 was 63 days instead of 31.
+      #   WHY IT WAS 2, causally: it was correct while `both` was still an ENGINE book, when the
+      #   pooled prediction frame really did carry two rows a symbol a day. Section 3.4 of
+      #   PRICE_GRID_DECLARATION.md turned the pooled book into an arithmetic sleeve sum, and this
+      #   value is the leftover of that change - the two decisions lock together.
+      #   Precedent: exness_fx_d1/config/setup.yaml:174 declares bars_per_day: 1 for the same
+      #   reason. ASSERTED, not merely written: 13_backtest measures rows-per-symbol-per-day
+      #   inside each book and requires it to equal this number on the modal day.
+      - {name: per_symbol_p80, method: per_symbol_rolling_percentile, long_q: 0.80, lookback_days: 63, bars_per_day: 1}
+    allocators:
+      - {name: score_weighted,  method: score_weighted}
+      - {name: inverse_vol,     method: inverse_vol}
+      - {name: risk_parity,     method: risk_parity}
+    cost_grid_bps: [0, 1, 2, 3, 5, 7, 10, 15, 20, 30, 50]
+    # The gate 16_costs has to clear, declared before it runs (roadmap.md:193,
+    # bot-portfolio-exness.md:121): the interpolated breakeven must exceed the ROUND TRIP at
+    # the p90 of the traded session, not the median, with this margin on top.
+    breakeven_gate:
+      reference: round_trip_p90_bps      # XAUUSD 1.2, XAGUSD 9.4 (costs.spread_bps_by_session)
+      safety_margin: 1.5                 # breakeven_bps > 1.5 x round_trip_p90 of the book
+    risk_controls:
+      position:
+        - {name: stop_loss_3pct,  type: stop_loss,     threshold: 0.03}
+        - {name: stop_loss_5pct,  type: stop_loss,     threshold: 0.05}
+        - {name: trailing_1pct,   type: trailing_stop, threshold: 0.01}
+        - {name: trailing_2pct,   type: trailing_stop, threshold: 0.02}
+        - {name: trailing_3pct,   type: trailing_stop, threshold: 0.03}
+        # `bars` is now an H1 BAR, not a decision slot (PRICE_GRID_DECLARATION.md section 2).
+        # The five threshold arms above are unaffected - they are percentages of price and do
+        # not read the grid. The two time arms did read it, and both were rewritten:
+        #   - time_exit_2 / time_exit_10 REMOVED. On the H1 grid, 10 bars can never fire: the
+        #     baseline hold already closes the position at 8. A rule that cannot fire is a
+        #     trial the Deflated Sharpe still divides by, so it is deleted rather than kept.
+        #   - hold_2h ADDED: a genuinely shorter hold than the 8-bar baseline, which is what
+        #     this dimension is meant to sweep.
+        - {name: hold_2h,         type: time_exit,     bars: 2}
+
+# The feature register, declared BEFORE any IC is read (roadmap.md:118-120, Ch20; precedent
+# bots/exness_fx_d1/BOT.md:151). `03_financial_features` binds every window from here and
+# renders `families` as the register table.
+#
+# TWO GRIDS, and which grid a family sits on is the design, not a detail
+# (bot-portfolio-exness.md:72-74): "moi cua so feature cua bot theo phien bi chan tai bien
+# phien, khong keo qua dem... Cua so dai hon mot phien dung nen D1."
+#   - `intraday` families read H1 bars and never cross the session boundary they belong to;
+#   - `long_window` families read D1 bars and are joined ASOF BACKWARD on the D1 bar's CLOSE
+#     instant (server midnight, 00:00 UTC), never on its calendar date. For a decision at
+#     09:00 UTC on day D the newest usable D1 bar is day D-1's, which closed at 00:00 UTC on
+#     day D. Precedent and test: exness_fx_d1/setup.yaml:313-318 and _features.features_as_of.
+# The payoff of splitting the grids: a 252-bar warmup is 252 D1 bars (about a year, available
+# from 2014) rather than 252 H1 bars, so a long feature does NOT push universe.history_start
+# forward. exness_fx_d1 lost 1,885 rows of warmup this way (BOT.md:81).
+features:
+  grid:
+    intraday: 1h
+    long_window: 1d
+    long_window_join: asof_backward_on_bar_close
+    # D1 bars are read from the first D1 bar the account serves (2014-01-12 / 2014-01-14), NOT
+    # from universe.history_start. That is the payoff of the two-grid design: a 315-D1-bar chain
+    # (a 63-day return standardized over 252 days) is already dense when the H1 panel opens in
+    # 2017, so no long feature pushes history_start forward. Compare exness_fx_d1, which lost
+    # 1,885 rows to warmup on one grid (bots/exness_fx_d1/BOT.md:81).
+    long_window_history_start: '2014-01-01'
+  # Priced but NOT traded. Both legs of the gold-silver ratio have to be observable; only one of
+  # them has to be in universe.symbols. Declared now because the phase-6 cost gate may take
+  # XAGUSD out of the universe (bots/assets/XAGUSD.md:144, PHASE1_SPEC_MENTOR.md section 2.e
+  # item 4), and without this the pivot in _features.gold_silver_ratio would find one column and
+  # the family both asset profiles name FIRST would vanish with the tradable leg. It raises now
+  # instead of returning three null columns.
+  reference_symbols: [XAGUSD]
+  windows:
+    # -- intraday, H1, inside the session --------------------------------------------------
+    # H1 bars of the session that have CLOSED at the decision. With the open+1h rule this is
+    # exactly one, by construction; it is a list so the value is checked rather than assumed.
+    session_bars: [1]
+    # H1 bars ending AT the session open: the overnight / previous-venue block. This is a
+    # separate family from the in-session one precisely because it crosses the boundary, and
+    # saying so is what keeps the "blocked at the session edge" rule honest instead of quietly
+    # broken. 2, 4, 6, 8 hours before the open.
+    pre_session_bars: [2, 4, 6, 8]
+    # Staleness ceiling on every pre-session probe, in minutes = one H1 bar. A backward asof join
+    # always returns something: through the daily 21:00-22:00 UTC break, over a holiday or over a
+    # weekend it reaches back until it finds a print, and pre_ret_8h would silently become a
+    # ten-hour or a sixty-hour return under the same name. A probe whose matched bar is older
+    # than this is NULL and counted, not stretched (_features.pre_session_features).
+    pre_session_max_bar_age_minutes: 60
+    # Trailing returns on the DECISION grid itself: 1, 2 and 5 previous slots (half a day, a
+    # day, half a week). One slot is one session, so none of these is a sub-session window.
+    prev_slots: [1, 2, 5]
+    # -- long window, D1 -------------------------------------------------------------------
+    momentum: [21, 63, 252]
+    garman_klass: [21, 63]
+    close_to_close_volatility: [21]
+    drawdown: [63]
+    zscore: 252              # trailing window the multi-horizon D1 returns are standardized on
+    zscore_horizons: [21, 63]
+    rsi: [14]
+    moving_average: [21, 63, 252]
+    # -- cross-instrument: the gold/silver ratio, the feature both asset profiles name first
+    # (bots/assets/XAGUSD.md:128, XAUUSD.md:129; Ch08 03_structural_cross_instrument_features)
+    ratio_zscore: 252
+    ratio_beta: 63
+    # -- PLANNED families (generation 2, block 3, GEN2_DECLARATION_2026-09-10.md section 3) --
+    # Documentation until the families are switched on: no column exists while
+    # FRED_API_KEY is empty, so 03 reads neither key and features/financial.parquet does not
+    # move. real_yield_zscore: trailing publications of the ALFRED-vintaged series
+    # (_features.real_yields_dollar); release_window_minutes: the +-30 minute avoid window of
+    # bots/assets/XAUUSD.md around CPI / FOMC (_features.release_windows).
+    real_yield_zscore: 252
+    release_window_minutes: 30
+  # EMPTY BY DESIGN. A cross-sectional percentile over two names takes two values a slot.
+  # PHASE1_SPEC_MENTOR.md section 2.d; the 8 rank_* columns of exness_fx_d1 were already
+  # stopped for staleness on five names (bots/exness_fx_d1/BOT.md:81).
+  ranked: []
+  # The column with the longest chain of trailing bars ON THE PANEL'S OWN GRID: a five-slot
+  # return needs five previous decisions. Rows are kept from the slot this column can first hold
+  # a value, and 03_financial_features asserts that dropping on it leaves no null anywhere else.
+  #
+  # Why not zscore_63d, the longest chain in the matrix (315 D1 bars). Because that chain is
+  # counted in D1 bars and the D1 frame is read from 2014 (features.grid.long_window_history_start)
+  # while the panel opens in 2017: every D1 column is already dense at panel row 1, so it binds
+  # nothing. If the D1 head start were ever removed, the assertion in 03 fires rather than the
+  # policy quietly leaving nulls behind. Changed 2026-09-08, before any IC was read.
+  null_policy_carrier: slot_ret_5
+  # THE NULL POLICY IS A CUT PLUS A DECLARED SET OF COLUMNS THAT MAY STAY NULL, and the second
+  # half is new (2026-09-08, before any IC was read). `exness_fx_d1` could assert zero nulls after
+  # the carrier cut because every one of its columns is a trailing window on a continuous session
+  # grid. Two families here cannot be:
+  #
+  #   * pre_ret_*h probe a fixed number of hours before the session open, and the tape is shut for
+  #     an hour every night, all weekend, and early on US holidays. With the one-bar staleness
+  #     ceiling above, a probe that lands in a shut market is NULL. Measured on the development
+  #     window: pre_ret_2h 13 rows, pre_ret_8h 169 (158 of them Monday London, where eight hours
+  #     before the open is Sunday night, and 159 of the 169 fall in 2017-2018 when the Sunday
+  #     22:00 UTC re-open bar was often absent).
+  #   * overnight_gap and prev_sess_ret read the SAME VENUE's previous session close, which does
+  #     not exist when that session was an early close. 167 rows, 161 of them New York, one every
+  #     US public holiday, evenly spread over all nine years.
+  #
+  # Cutting those rows instead would drop about 3.4 % of the panel, concentrated on holidays and
+  # thin Mondays - reintroducing exactly the availability-driven selection the decision/endpoint
+  # split in _features.decision_grid was written to remove. A null is visible to the coverage
+  # screen in 05_evaluation (COVERAGE_FLOOR) and to any model that must handle it; a dropped
+  # holiday row is invisible everywhere.
+  null_policy:
+    carrier: slot_ret_5
+    may_be_null: [pre_ret_*h, overnight_gap, prev_sess_ret]
+    max_null_share: 0.05     # per column, on the development window; 03 asserts it
+    # OPEN, phase 4: LightGBM reads a null as a branch; scikit-learn raises on one. The linear
+    # menu therefore needs an imputer INSIDE the fold pipeline (fitted on training rows only) or
+    # a per-model row filter, and which of the two is a declared choice, not a default.
+  persistence_horizon: 126   # decision slots F6 reads the feature autocorrelation out to
+  redundancy_cut: 0.7
+  # The scale-independent staleness screen, PRE-DECLARED 2026-09-08 in bots/exness_gold_sess/
+  # BOT.md ("Pre-declaration: a scale-independent staleness screen") before one number of it
+  # was computed, installed 2026-09-10 by GEN2_DECLARATION_2026-09-10.md ruling 3.2. It stands
+  # BESIDE the bit-identity screen of 05_evaluation (shared with four case studies, not edited):
+  # 05 prints it as a second table and carries its verdict as the ledger column
+  # scale_free_verdict; the ledger's decision column is still the first screen's. Read by
+  # case_studies/exness_gold_sess/_screens.py through 05; enters no hash. Every statistic is a
+  # ratio; a cell with |mean| < std skips the CV test (zero-mean safe). Not to be moved after a
+  # column has been seen to fail it.
+  scale_free_screen:
+    n_unique_ratio_stop: 0.01     # n_unique / n below this, pooled or median over (fold, symbol) cells -> STOP
+    cv_stop: 1.0e-6               # median CV over cells below this -> STOP
+    cv_revise: 1.0e-4             # median CV in [cv_stop, cv_revise) -> REVISE
+    modal_share_revise: 0.20      # share of rows at the modal value above this -> REVISE
+    modal_share_stop: 0.50        # ... above this -> STOP
+    declared_on: '2026-09-08'
+  families:
+    - name: session opening move
+      pattern: sess_ret_1h|sess_range_1h|sess_close_pos_1h
+      role: signal
+      hypothesis: The first hour of a session prices the order flow that waited for it, and the rest of the session continues or fades it
+      inputs: H1 bars of this session only
+      lookback: 1
+      lag: 0
+      frame: time series
+      representation: return over the opening hour, its high-low range, and where the close sits inside that range
+      failure_mode: one bar is one observation; on a quiet session it is mostly spread
+    - name: overnight and pre-session
+      pattern: pre_ret_*h|overnight_gap|prev_sess_ret
+      role: signal
+      hypothesis: What the metal did while this venue was shut is information the venue has not traded on yet, and it decomposes into the move outside the session and the move inside the previous one
+      inputs: H1 bars ending at the session open, and the previous session OF THE SAME VENUE (its open and its close, both strictly in the past of this decision)
+      lookback: 8
+      lag: 0
+      frame: time series
+      representation: returns over 2, 4, 6 and 8 hours before the open; overnight_gap = this session's open over the same venue's previous close; prev_sess_ret = that previous session's own open-to-close move
+      failure_mode: crosses the session boundary on purpose, so it is exposed to the daily 21:00-22:00 UTC break and to holidays - every probe therefore carries the one-bar staleness ceiling above and is NULL rather than stretched when the tape was shut
+    - name: session momentum on the decision grid
+      pattern: slot_ret_*
+      role: signal
+      hypothesis: A session that moved is followed by sessions that move the same way
+      inputs: decision-grid closes
+      lookback: 5
+      lag: 0
+      frame: time series
+      representation: return over 1, 2 and 5 previous decision slots
+      failure_mode: the two venues alternate, so a 1-slot return compares London with New York
+    - name: long-window state
+      pattern: d1_ret_*d|d1_vol_gk_*d|d1_vol_cc_*d|d1_max_dd_*d|zscore_*d|d1_rsi_*|d1_price_to_ma_*
+      role: state
+      hypothesis: Where the metal sits in its own year conditions what a one-session signal is worth
+      inputs: D1 bars closed at or before the decision instant (asof backward on the bar close)
+      lookback: 315
+      lag: 0
+      frame: time series
+      representation: trailing D1 momentum, Garman-Klass volatility, drawdown, z-score, oscillator, price to moving average
+      failure_mode: a D1 bar closes at 00:00 UTC, so at the London decision it is already nine hours old
+    - name: gold-silver ratio
+      pattern: gsr|gsr_z_*|gsr_beta_*
+      role: signal
+      hypothesis: The two metals share a driver (real yields and the dollar) and the ratio mean-reverts when one leg moves first
+      inputs: XAUUSD and XAGUSD D1 closes, same asof-backward join
+      lookback: 252
+      lag: 0
+      frame: cross-asset
+      representation: the ratio, its trailing z-score, and each leg's rolling beta to the other
+      failure_mode: the ratio trends for years; a z-score calls every year of a trend a dislocation
+    - name: session and calendar flags
+      pattern: is_*|dow|news_*
+      role: state
+      hypothesis: Cost, liquidity and headline risk differ by session, by daylight-saving season, by weekday and around scheduled releases; they condition a signal, they are not one
+      inputs: the decision timestamp, the venue's own zone database offset, and the payroll release rule - no market data at all, so every value is knowable weeks in advance
+      lookback: 0
+      lag: 0
+      frame: state
+      representation: "is_ny (which venue), is_venue_dst (the venue is on summer time, so the decision sits an hour earlier in UTC), dow, news_nfp_decision_bar (the payroll release falls inside the decision bar itself), news_nfp_label_window (it falls inside the hold)"
+      failure_mode: "a flag that is constant inside a filtered book carries nothing there - is_ny is exactly that inside the london and ny books, which is why 05_evaluation runs the staleness screen per book. The eight sessions.py flags that are CONSTANT at every decision instant of this grid (london and market_open always true; edge_open, edge_close, rollover, sydney, us_cash, asia always false) are asserted in bots/exness_gold_sess/tests/test_sessions.py rather than shipped as rank-deficient columns; edge_open being false everywhere IS the 30-minute edge block holding. The NFP rule (first Friday, 08:30 New York) moves when that Friday is a holiday and moved during the 2013 and 2018-19 shutdowns, so the flag is wrong on a handful of months - still knowable in advance, which is the property that matters"
+    - name: CPI and FOMC release windows
+      pattern: PLANNED
+      role: state
+      hypothesis: The two releases gold reprices hardest on are CPI and the FOMC statement; a session holding through one is a different session
+      inputs: PLANNED - not built. Unlike payrolls (first Friday, 08:30 New York) neither date is a RULE - both are announced schedules - so the flags need an economic-calendar file. data/macro/config.yaml carries no release calendar and FRED_API_KEY is absent from the WSL .env, and a hand-typed table of 90-odd dates would be an unversioned data source with no provenance
+      lookback: 0
+      lag: 0
+      frame: state
+      representation: PLANNED - release inside the decision bar, and release inside the hold, the same two flags the payroll rule already produces
+      failure_mode: declared PLANNED rather than silently omitted; +1 trial family when it is first tried, the way exness_fx_d1 handles carry (BOT.md:116)
+    - name: real yields and the dollar
+      pattern: PLANNED
+      role: state
+      hypothesis: Gold is priced off US real yields and the dollar; the session move is the local expression of that
+      inputs: PLANNED - not built. bots/assets/XAUUSD.md:128 names real yields as the primary driver, but data/macro/config.yaml does not carry them and FRED_API_KEY is absent from the WSL .env (bots/exness_fx_d1/BOT.md:167)
+      lookback: 0
+      lag: 0
+      frame: cross-asset
+      representation: PLANNED
+      failure_mode: counted as +1 trial when it is first tried, the way exness_fx_d1 handles carry (BOT.md:116)
+
+# Declared 2026-09-07 from the B0 depth measurement, BEFORE any label, feature or model exists
+# for this bot (roadmap.md:72-73). BRANCH A of PHASE1_SPEC_MENTOR.md section 2.c': B0 showed
+# both metals dense from 2017-02-27, so the branch written for "one metal lacks history" does
+# not apply and both stay in the universe.
+#
+# Development window 2017-02-27 -> 2025-08-31 = 8.5 years. Four folds stepping back a year:
+#   fold 0: train 2021-09 -> 2024-08, validate 2024-09 -> 2025-08
+#   fold 1: train 2020-09 -> 2023-08, validate 2023-09 -> 2024-08
+#   fold 2: train 2019-09 -> 2022-08, validate 2022-09 -> 2023-08
+#   fold 3: train 2018-09 -> 2021-08, validate 2021-09 -> 2022-08
+# (the exact boundaries are authored by utils.cv_splits.generate_cv_splits from this block and
+# printed by 01_feasibility_analysis; the lines above are the design, not a second source.)
+# The same 4 x (P3Y, P1Y) geometry as exness_fx_d1 (setup.yaml:344-348) and xau_fx_mt5
+# (setup.yaml:359-361), so the three bots on this account stay comparable.
+evaluation:
+  n_splits: 4
+  train_size: P3Y
+  val_size: P1Y
+  # The final twelve months of existing history - the exness_fx_d1 convention, not the future
+  # shadow tape of xau_fx_mt5 (setup.yaml:362-365). This bot has no shadow tape running and
+  # xau_fx_mt5's holdout_min_weeks: 12 would block phase 7 indefinitely. Declared here, never
+  # moved, scored ONCE by 17_holdout_predictions / 18_holdout_backtest.
+  holdout_start: '2025-09-01'
+  holdout_end: '2026-08-31'
+  # Contamination flag. CHECKED read-only 2026-09-07 in the pristine archive
+  # D:/05_Quant/_archive/v9_continuum_original/config/symbols.py (the per-bot copy under
+  # bots/exness_gold_sess/legacy_v9_continuum/ was pruned away in this checkout): the legacy
+  # bot's SYMBOLS carries exactly one metal, "XAUUSD" (category GOLD, contract_size 100,
+  # symbols.py:90-95), and it is also in SUPER_ELITE_SYMBOLS (symbols.py:109). XAGUSD is NOT
+  # in the file. The legacy bot ran on this same demo login until 2026-09-05
+  # (bots/exness_gold_sess/BOT.md, "Legacy bot running?"), so its results over the holdout
+  # window have been seen by a human before this bot's holdout is scored. Modelled on
+  # xau_fx_mt5/setup.yaml:366 (v9_contaminated_window).
+  # Consequence, declared now rather than argued later: the holdout may CONFIRM, it may not
+  # SELECT, and no parameter of this bot may be chosen because it resembles a v9 rule.
+  legacy_v9_symbols: [XAUUSD]
+  legacy_v9_contaminated_window: ['2025-09-01', '2026-08-31']
+  # The calendar utils/cv_splits counts train and validation windows on (mapped to CME_FX by
+  # _CALENDAR_MAP). Distinct from decision.session_calendar above.
+  calendar: FX
+  # 504 -> 252 on 2026-09-08, PRICE_GRID_DECLARATION.md section 2. The old value annualised the
+  # DECISION grid; this key annualises the RETURN grid, and the engine writes returns BY DAY -
+  # extract_daily_returns_frame(...) -> to_daily_pnl() (backtest_runner.py:1582-1586,
+  # backtest_loaders.py:2075-2096). The header note at backtest_runner.py:56-63 measured exactly
+  # this: "Measured grid frequencies are 252/yr for ... nasdaq100_microstructure despite ...
+  # intraday signals", and nasdaq runs a one-minute feed while declaring 252
+  # (nasdaq100_microstructure/config/setup.yaml:600). The H1 price grid does NOT make this 6,084.
+  # 504 was also not merely harmless: on a daily series it inflates Sharpe by sqrt(504/252) =
+  # 1.414x, and reconcile_periods_per_year would NOT have caught it - a 24/5 daily grid observes
+  # ~5 x 52.18 = 260.9 rows a year, 261/504 = 0.518 >= 0.5, so the declared value would stand
+  # (backtest_runner.py:142-143). At 252 the ratio is 261/252 = 1.036 and the reconciler again
+  # keeps the declared value, this time correctly. Matches exness_fx_d1 (setup.yaml:350) - same
+  # FX calendar, same daily mark-to-market. NOT per label: annualisation is a property of the
+  # return grid, and the 24-hour book still writes one row per business day.
+  # 504 has not been deleted, it has MOVED to decision.slots_per_year, where slot-level
+  # statistics (N, N_eff, IC, the training floor) read it.
+  periods_per_year: 252
+
+labels:
+  # Return from the decision bar's close to the SESSION CLOSE. With the open+1h rule the
+  # horizon is exactly 8 H1 bars in both sessions and both seasons (a 9-hour session entered
+  # in its first hour and left in its ninth), which is why the name is arithmetic. A name like
+  # fwd_ret_sess_close would fall through resolve_label_horizon to the buffer - the trap
+  # nasdaq100_microstructure/config/setup.yaml:604-607 records - so `horizons` is also explicit.
+  #
+  # GENERATION 2 - 2026-09-10, bots/exness_gold_sess/GEN2_DECLARATION_2026-09-10.md section 2,
+  # written with training_runs 216 / prediction_sets 801 / backtest_runs 1,674 and 0 rows of
+  # generation 2. The primary label is fwd_ret_sess: the return from the decision bar's close to
+  # the LAST H1 bar close at or before the session close at which a next_bar_open exit can still
+  # fill (a bar opens at that instant; case_studies/exness_gold_sess/_hold.py::tradable_exit).
+  # One rule, two constants that fall out of the tape: London 8 bars (== fwd_ret_8h), New York
+  # 7 bars (== the fwd_ret_7h_probe of _report_phase5.py) - see `tradable_exit` below.
+  #   fwd_ret_8h  left the modelling menu (ruling 2.2): its New York window is not traded, a
+  #               defect declared BEFORE the generation-1 sweep (this file, backtest.exit_gap_
+  #               minutes_by_book); its 1,068 trials are SPENT and still counted.
+  #   fwd_ret_24h DEFERRED, not dropped (ruling 2.3): its cost cannot be priced until the real
+  #               Pro account is read (costs.swap.measured_on_account: real, D6.3); it returns as
+  #               its own cohort, +1,068 at the menu of that day. +0 now.
+  #   dir_tb_8h   CLOSED (ruling 2.4): gate (2) failed in generation 1, +0.
+  # The three generation-1 parquets stay on disk, unrepublished (02_labels asserts their
+  # digests before and after its publish loop). Every key below that still names them
+  # (variant_buffers, rebalance_step, classification_eval_label, triple_barrier,
+  # classification_scoring) is INERT documentation and is not edited: two of them are
+  # repository-pinned keys (L0.5.6) and the rest are the record of what was declared.
+  primary: fwd_ret_sess
+  variants: []
+  horizons:
+    # fwd_ret_sess: an UPPER bound - London resolves in 8 bars, New York in 7. The buffer
+    # resolver reads this key rather than parsing the name (BOT.md, labels row).
+    fwd_ret_sess: 8H
+    fwd_ret_8h: 8H
+    fwd_ret_24h: 24H
+    dir_tb_8h: 8H
+  # Documentation of the generation-2 endpoint rule (GEN2 section 2, ruling 2.1). Read by no
+  # code, enters no hash; the numbers are OUTPUTS of _hold.derive_hold_bars (measured
+  # 2026-09-08 on 3,612 london + 3,475 ny sealed endpoints) and of _hold.tradable_exit, which
+  # tests/test_labels_gen2.py asserts agree on 100 % of the rows the folds reach.
+  tradable_exit:
+    rule: last_h1_bar_open_at_or_before_label_end
+    by_book_bars: {london: 8, ny: 7}
+    derived_by: _hold.derive_hold_bars
+    equals: {london: fwd_ret_8h, ny: fwd_ret_7h_probe}
+    declared_on: '2026-09-10'
+  # Purge gap between train_end and val_start, counted in SESSIONS of evaluation.calendar
+  # (buffer_unit defaults to "sessions", utils/artifact_specs.py:126). fwd_ret_8h resolves
+  # inside its own calendar day, so one session is already conservative; fwd_ret_24h resolves
+  # at the same slot the next day and needs two.
+  buffer: 1D
+  variant_buffers:
+    fwd_ret_24h: 2D
+    dir_tb_8h: 1D
+  # ---------------------------------------------------------------------------------------
+  # REPOSITORY-PINNED KEY 1 of 2. Authored here on 2026-09-07 with run_log/ EMPTY, derived
+  # from the cadence and the horizon, never inferred from data
+  # (.claude/skills/ml4t/references/case-studies.md:139-151; SKILL.md rule 5). It does not
+  # enter any hash, so editing it later would silently reuse rows built under the old rule.
+  # The schedule has 2 slots a weekday, so: 8h = one slot, 24h = two slots.
+  #
+  # KNOWN AND ACCEPTED, because bending the number would hide it rather than fix it: on the
+  # pooled book a London decision (09:00 UTC) is held to 17:00 UTC while the New York slot
+  # (14:00 UTC) opens INSIDE that hold, so consecutive holds overlap by three hours. The
+  # honest treatment (PHASE1_SPEC_MENTOR.md section 2.c) is to keep step 1 and treat the two
+  # sessions as two sleeves of one book, report N_eff in 02_labels, and use HAC lags at least
+  # as long as the overlap in every IC inference. 13_backtest must additionally print
+  # resolve_rebalance_timestamps on the FILTERED grid before any sweep: with one session the
+  # effective schedule is 1 slot a day, so a step of 2 walks two days, not one - the
+  # nasdaq100_microstructure failure, "the values did not change; what they count did"
+  # (setup.yaml:632-641).
+  #
+  # RE-AUTHORED 2026-09-08 by PRICE_GRID_DECLARATION.md section 2, while run_log/ was still
+  # empty and no registry.db existed (verified before the edit). fwd_ret_24h moved 2 -> 1, and
+  # that move is a bug fix, not a preference:
+  #   - the step counts SLOTS OF THE SCHEDULE THE RUN RESOLVES, and 13_backtest filters by
+  #     session first. On the `london` book the schedule is 1 slot a day, so step 2 trades every
+  #     OTHER day - a 48-hour cadence for a 24-hour label;
+  #   - on the pooled sleeve list the schedule is [London d1, NY d1, London d2, ...] and
+  #     gather_every(2) (backtest_loaders.py:1581) keeps indices 0, 2, 4 ... = ONE VENUE, so the
+  #     24-hour book would quietly become a single-session book.
+  # No value of a per-label key is right on all three books except 1. The 24-hour HOLD is not
+  # expressed here at all: it is the TimeExit backstop in the 13_backtest spec, whose real exit
+  # is the next same-venue decision overwriting the weight.
+  #   THE BACKSTOP IS 23 BARS, NOT 24, and it is DERIVED rather than typed
+  #   (NY_EXIT_DECLARATION.md section 6.1, case_studies/exness_gold_sess/_hold.py::
+  #   derive_backstop_bars). Twenty-four hours of clock contains twenty-four grid steps and the
+  #   tape swallows one of them every day at the recurring break, so i1 - i0 is 23. MEASURED
+  #   2026-09-08 over 2,870 sealed endpoints a book on the tape the folds reach: 23 on 2,770 of
+  #   them in BOTH books, with an exit gap of 0 minutes and 1,440 clock minutes on 100 %. The 100
+  #   rows a book that give 19-22 every one carry MORE holes inside the hold (public holidays),
+  #   which is asserted rather than assumed - a row with the same holes and a different N raises.
+  rebalance_step:
+    fwd_ret_8h: 1
+    fwd_ret_24h: 1
+    dir_tb_8h: 1
+    # ADDED 2026-09-10 (GEN2_DECLARATION_2026-09-10.md L0.5.6) for a label that had NO
+    # registered row at the time of writing (training_runs 216 / prediction_sets 801 /
+    # backtest_runs 1,674, none of them fwd_ret_sess) - so the addition cannot mix two
+    # methodologies in one registry. The three entries above are NOT edited. Same value and
+    # same reasoning as fwd_ret_8h: one slot per decision on a two-slot-a-day schedule, the
+    # overlap carried as a HAC lag, never bent away. Never to be edited after the first
+    # fwd_ret_sess row is registered.
+    fwd_ret_sess: 1
+  # REPOSITORY-PINNED KEY 2 of 2, same conditions. dir_tb_8h is a classification label, so
+  # LabelCatalog.publish requires a continuous evaluation label in the SAME frame
+  # (case_studies/research/labels.py:143-159); it is the return over the same window the
+  # barriers are evaluated on.
+  classification_eval_label:
+    dir_tb_8h: fwd_ret_8h
+  # Triple-barrier construction for dir_tb_8h (Ch07 03_label_methods). The barriers are ATR
+  # scaled, not fixed percentages, because gold and silver have very different volatility
+  # (bots/assets/XAGUSD.md:66) and a fixed percentage would be hit constantly on silver and
+  # never on gold, and because the same percentage means different things in 2017 and 2026.
+  # `max_holding` is cut at the session close as well as at 8 bars: on an early close 8 bars
+  # would run past it.
+  triple_barrier:
+    atr_source: d1_atr_14           # D1 ATR(14) as a fraction of the D1 close, asof backward
+    upper_atr_multiple: 0.5         # declared, not tuned; tuning it is a trial
+    lower_atr_multiple: 0.5         # symmetric, so the label carries no built-in direction
+    max_holding_bars: 8
+    cut_at_session_close: true
+    timeout_label: 0                # neither barrier touched -> 0; the three classes are -1, 0, +1
+  # -----------------------------------------------------------------------------------------
+  # What dir_tb_8h is scored with, and what it is NOT scored with. DECLARED 2026-09-08 with
+  # run_log/ still EMPTY, before 06_linear or 07_gbm was run, so no result was seen first.
+  # This block is documentation: no stage reads it, and it does not enter any hash. It exists
+  # because the mentor asked the question ("02_labels produced no uniqueness sample weights
+  # for it") and an answer that lives only in a notebook cell is an answer that drifts.
+  #
+  # WHAT IT IS SCORED WITH (from case_studies/utils/registry/metrics.py, task_type
+  # "classification", resolved through labels.classification_eval_label above):
+  #   ic_mean          the model score against fwd_ret_8h, the continuous return over the same
+  #                    window the barriers are evaluated on. NULL on this bot for a reason that
+  #                    has nothing to do with the label: it is a CROSS-SECTIONAL Spearman under
+  #                    a hard-coded min_obs=5 (metrics.py:113) and this panel is 2 metals wide,
+  #                    so no decision instant is scorable. Measured 2026-09-08 on a synthetic
+  #                    two-name panel of 500 slots: n_periods 0, ic_mean nan. Replaced
+  #                    throughout by the POOLED PANEL IC of
+  #                    case_studies/exness_gold_sess/_model_reading.py, the statistic
+  #                    05_evaluation already used on the features.
+  #   accuracy, balanced_accuracy, log_loss, brier_score, auc_pr   on the 3-class label itself.
+  #   auc_roc          derived by collapsing to "up vs not-up" (metrics.py:141-153). Read it
+  #                    knowing the collapse puts the 0 (timeout) class in with the falls, and
+  #                    the timeout class is the LARGEST of the three: 2,048 of 4,793 on XAUUSD
+  #                    (43 %) and 1,991 of 4,788 on XAGUSD (41 %), measured in 02_labels.
+  #   auc_mean_daily, auc_t_hac   NULL, for two independent reasons: the label has three states
+  #                    and an AUC needs two (metrics.py:256-257 tests the class set), and the
+  #                    daily AUC is cross-sectional at min_obs=5 on a 2-name panel.
+  #
+  # WHAT IT IS NOT SCORED WITH: uniqueness sample weights. Chapter 7's weights come from
+  # LabelingConfig.triple_barrier(..., calculate_uniqueness=True)
+  # (07_defining_the_learning_task/03_label_methods.py:520 ->
+  # ml4t.engineer.labeling.triple_barrier:397-402, calculate_label_uniqueness +
+  # calculate_sample_weights). 02_labels does not produce them and will not, because:
+  #   1. NOTHING IN THE FITTING PATH CAN CONSUME ONE. `grep -rn sample_weight case_studies/
+  #      utils/` returns zero hits. case_studies/utils/folds.py builds X_train/y_train and the
+  #      estimators are called as fit(X, y); case_studies/utils/linear.py, gbm.py and
+  #      research/models.py have no weight parameter. The column would be an artifact no stage
+  #      reads. The only three files in this repository that pass sample_weight are chapter
+  #      notebooks calling scikit-learn directly.
+  #   2. IT WOULD MOVE THE LABEL IDENTITY FOR NO EFFECT. dir_tb_8h is sealed at digest
+  #      1eb71e01111c53b3 over 9,581 rows and every phase-2/3 artifact is pinned to it; a new
+  #      column re-hashes the frame and everything downstream, to feed a parameter no fitting
+  #      function accepts.
+  #   3. THE OVERLAP IT WOULD CORRECT FOR IS ALREADY MEASURED AND ALREADY CORRECTED. 02_labels
+  #      reports N_eff 4,284 against N 8,567 for dir_tb_8h, ratio 0.5001, because exactly one
+  #      later decision starts inside every holding window. This bot answers that by correcting
+  #      INFERENCE at HAC lag 2 everywhere (05_evaluation, 06_linear, 07_gbm, 12_model_analysis)
+  #      rather than by reweighting the fit.
+  # The cost of (3), stated rather than hidden: uniqueness weights change the ESTIMATE by
+  # down-weighting the overlapped half of each window; a HAC lag leaves the fit alone and widens
+  # the INTERVAL. They are not the same correction. If a later generation wants the weighted
+  # fit, the change is to the SHARED runner (folds.py + linear.py/gbm.py), not to this case
+  # study, and it must be made on an empty run log because it moves every training identity.
+  classification_scoring:
+    dir_tb_8h:
+      fitting_target: dir_tb_8h            # the 3 classes -1 / 0 / +1
+      ranking_statistic: pooled_panel_ic   # case_studies/exness_gold_sess/_model_reading.py
+      ranking_target: fwd_ret_8h           # = labels.classification_eval_label[dir_tb_8h]
+      # ---------------------------------------------------------------------------------------
+      # THE SCALAR SCORE, WRITTEN OUT. FOLD_GEOMETRY_DECLARATION.md section 4 condition (1),
+      # declared 2026-09-08 with run_log/ EMPTY and BEFORE the first fit of this label.
+      # A pooled panel IC needs one number per (slot, metal); a 3-class model emits three
+      # probabilities. Which number is used is a modelling decision, and it is declared here
+      # rather than left to whichever runner happens to execute the fit:
+      #
+      #     score = P(up) - P(down)          (the timeout class carries weight 0)
+      #
+      # This is NOT a new convention; it is the one the shared runners already implement, and
+      # they implement it only because `triple_barrier.timeout_label` above is 0 and the three
+      # class values are therefore -1 / 0 / +1:
+      #   case_studies/utils/linear.py:955-956   probabilities @ sorted(class_values)
+      #   case_studies/utils/gbm.py:1303-1304    proba @ sorted(class_values)
+      #     = P(down)*(-1) + P(timeout)*0 + P(up)*(+1) = P(up) - P(down).
+      # The binary branch of gbm.py:1300-1302 (raw P(class=1)) does NOT apply here: this label
+      # has three classes. If a later generation moves `timeout_label` off 0, the runner's
+      # collapse stops being P(up) - P(down) and this key becomes a lie - which is exactly why
+      # it is written out instead of inherited.
+      probability_to_score: p_up_minus_p_down
+      probability_to_score_actual: fwd_ret_8h   # the same target the primary label is scored on
+      # ---------------------------------------------------------------------------------------
+      # THE GATE. FOLD_GEOMETRY_DECLARATION.md section 4, declared 2026-09-08 BEFORE any fit.
+      # dir_tb_8h costs 378 of the 2,514 trials in the Trials table (3 books x 63 prediction
+      # sets x 2 signal specs). It earns them only by answering a question fwd_ret_8h cannot.
+      # It is kept in the menu, and the mentor's reason for keeping it is that the
+      # uniqueness-weight objection does NOT bite on this grid: concurrency is a constant 2
+      # (N_eff/N = 0.5001, "exactly one later decision starts inside every holding window"), so
+      # uniqueness weights would be uniform and would move the estimate by exactly zero. What
+      # the overlap really damages is the interval, and that is corrected at HAC lag 2.
+      trial_gate:
+        trials_at_stake: 378               # 3 books x 63 prediction sets x 2 signal specs
+        declared_on: '2026-09-08'
+        declared_before_first_fit: true    # run_log/ empty, no registry.db, 0 trials spent
+        # (2) BEAT THE PRIMARY LABEL ON THE PRIMARY LABEL'S OWN FIELD.
+        condition_beats_primary: >-
+          the best dir_tb_8h configuration must have a HIGHER pooled panel IC (HAC-corrected,
+          _model_reading.pooled_panel_ic_series against fwd_ret_8h) than the best fwd_ret_8h
+          configuration, on the SAME folds 0-3. Losing here means the 63 prediction sets are
+          63 extra draws on one target: they inflate the maximum a Deflated Sharpe has to
+          correct for without adding a dimension of information.
+        # (3) OR PROVE WHAT A REGRESSION LABEL CANNOT EXPRESS: THE VALUE OF NOT TRADING.
+        condition_value_of_abstention: >-
+          measured on the slots where the model predicts the timeout class - hit rate and
+          after-cost return on the TRADED subset against the full set, and a breakeven cost from
+          16_costs HIGHER than the fwd_ret_8h book of the same session book. 42 % of this
+          label's mass (4,039 of 9,581) is the timeout class, and that mass is the only economic
+          content it adds over fwd_ret_8h.
+        # NOT USED TO SELECT, only to describe: auc_roc collapses 3 classes to "up vs not-up"
+        # (metrics.py:143-154), which throws the timeout class in with the falls - exactly the
+        # distinction the triple barrier exists to draw - and analytics.py:376-377 records that
+        # the pooled statistic "also rewards a model for the base rate moving through time",
+        # while this bot's own Hypothesis says the 2017-2026 sample trends up.
+        auc_roc_is_descriptive_not_selective: true
+        on_failure: >-
+          neither (2) nor (3) met -> the label is CLOSED, its 378 trials are recorded as SPENT
+          (they were scored), K stays 2,514, and the Trials table says it was tried and rejected.
+          Closing it after the fits is not a saving; only a decision taken before them is.
+      # The overlap MEASURED on the decision grid (one later decision starts inside every 8-hour
+      # hold), passed to compute_ic_hac_stats as label_horizon. It is a FLOOR, not the lag that
+      # is applied: the function uses max(label_horizon - 1, Newey-West auto) capped at T // 2,
+      # and on a few thousand slots the automatic bandwidth (floor(4 * (T/100) ** (2/9)), about
+      # 9) is larger and therefore what gets used. The floor guarantees the interval can never
+      # be narrower than the dependence the grid actually has.
+      hac_lag_floor: 2
+      registry_ic_null: true               # cross-sectional min_obs=5 on a 2-name panel
+      registry_auc_daily_null: true        # 3 classes, and the same 2-name panel
+      classification_metrics: [accuracy, balanced_accuracy, log_loss, brier_score, auc_pr, auc_roc]
+      sample_weights: none
+      sample_weights_reason: >-
+        no case-study fitting path accepts a weight (grep sample_weight -> 0 hits in
+        case_studies/ and utils/); adding the column would move the sealed label digest
+        1eb71e01111c53b3 for no effect; and the overlap it would correct for is already
+        corrected in inference at HAC lag 2, measured as N_eff/N = 0.5001 in 02_labels.
+
+modeling:
+  # DECLARED 2026-09-08, before 06_linear was run. bots/exness_gold_sess/BOT.md left this open
+  # for phase 4 ("the linear menu needs either an imputer inside the fold pipeline or a per-model
+  # row filter, and which of the two is a declared choice recorded before 06_linear runs").
+  # It is the imputer, and it is not a new choice: it is what the shared runner already does,
+  # read out of the library rather than reimplemented. Documentation only; no stage reads this
+  # block and it does not enter any hash.
+  linear:
+    # case_studies/utils/linear.py:402-403, preprocessing identity
+    # "median-imputer-standard-scaler/v1": SimpleImputer(strategy="median") then
+    # StandardScaler(with_mean, with_std), BOTH FITTED ON THE TRAINING ROWS OF THE FOLD and then
+    # applied to the validation rows, so nothing from the validation window reaches the fit.
+    null_policy: median_impute_in_fold_pipeline
+    # The nulls this is for, measured on the feature matrix 03 wrote: pre_ret_*h carry 12-166
+    # null rows and overnight_gap / prev_sess_ret carry 163. Dropping those rows instead would
+    # give each configuration a different sample and make the 28 ICs incomparable, which is the
+    # reason the alternative was rejected rather than merely not chosen.
+    null_policy_alternative_rejected: drop_rows_with_any_null
+  gbm:
+    libraries: [lightgbm]
+    preset: default
+    device: cpu
+    max_bin: 255                    # LightGBM's own CPU default (exness_fx_d1/setup.yaml:378)
+    # NOT declared here on purpose: num_threads. It is a property of the host, it IS part of
+    # every training identity (resolve_gbm_execution_config, gbm.py:366, default 8), and
+    # declaring it in the repository copy would move the hash for every reader. It belongs in
+    # the EXPERIMENT's config/setup.yaml as `num_threads: 2` when running under WSL2, where
+    # 8 threads was measured at 78 s per fit against 1.2 s at 2 (bots/exness_fx_d1/BOT.md,
+    # Decisions log 2026-09-05). The companion environment note, which is NOT part of any hash
+    # and so has to be written down somewhere: LD_LIBRARY_PATH must reach libgomp.so.1 or
+    # LightGBM imports and then fails inside OpenMP at fit time. REPRODUCED 2026-09-08 on the
+    # WSL2 host: `import lightgbm` raises `OSError: libgomp.so.1: cannot open shared object
+    # file`, and the library is at /home/pro_trader/omp/libgomp.so.1 (and in the sudo-free conda
+    # toolchain at /home/pro_trader/cc/lib/), NOT in /usr/lib/x86_64-linux-gnu - this host has no
+    # libgomp1 package. `LD_LIBRARY_PATH=/home/pro_trader/omp:$LD_LIBRARY_PATH` fixes it and was
+    # verified today (lightgbm 4.6.0 imports, resolve_gbm_execution_config returns
+    # ('cpu', 255, 2)).
+
+causal:
+  # The one intraday signal column whose construction window is unambiguous.
+  treatment: sess_ret_1h
+  treatment_window: 1               # one H1 bar; the block permutation only has to span that
+  confounders: [d1_vol_gk_21d, d1_vol_gk_63d, zscore_21d]
+  method: walk_forward_dml

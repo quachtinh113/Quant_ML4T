@@ -1,0 +1,681 @@
+strategy_id: exness_usidx_sess
+setup_version: v1
+
+# Route B fork of case_studies/exness_fx_d1 (itself a fork of fx_pairs), for the two US index
+# CFDs of bots/exness_usidx_sess. Symbols are the *bare* names; the Market Watch name (with the
+# account suffix "m": US500m, USTECm) is applied only inside bots/_shared/mt5_loader.py through
+# SYMBOL_MAP. Profiles: bots/assets/US500.md, bots/assets/USTEC.md.
+#
+# Two indices are not a cross-section. fx_pairs and exness_fx_d1 rank five pairs against each
+# other; ranking two instruments is a spread trade, not the time-series bot bots/README.md
+# declares. The mapping block below therefore uses a per-symbol threshold on the model's own
+# score (case_studies/utils/signals.py), the framing of Chapter 16
+# 04_single_asset_ml4t_backtest / 05_stateful_strategies.
+universe:
+  symbols:
+    - US500
+    - USTEC
+  n_assets: 2
+  # First H1 bar this account serves for either index (data/mt5/history_depth.json, read
+  # 2026-09-05 on Exness-MT5Trial7: US500 22,554 H1 bars, USTEC 22,553, both 2022-10-25 ->
+  # 2026-09-04). This is the server's depth, not a download limit: terminal_info.maxbars is
+  # 100,000. D1 goes back to 2019-07-16 on both and is the source for any feature window
+  # longer than the H1 history can warm up.
+  history_start: '2022-10-25'
+  # The D1 parquet, used from phase 3 onward for windows the H1 grid cannot warm up.
+  daily_history_start: '2019-07-16'
+
+decision:
+  cadence: session_us_cash
+  # TWO snapshots per session, one per label spec, both on the H1 grid and both derived from
+  # the NYSE calendar at run time - never hard-coded. bots/assets/US500.md gives the winter
+  # figures; the summer ones are one hour earlier and the half-days (13:00 New York) three
+  # hours earlier, which is why the calendar and not a table decides:
+  #
+  #   us_cash_open   = the close of the first H1 bar that closes at or after
+  #                    NYSE open + open_delay_minutes  -> 15:00 UTC winter, 14:00 UTC summer
+  #   us_cash_close  = the close of the last H1 bar that closes at or before NYSE close
+  #                    -> 21:00 UTC winter, 20:00 UTC summer, 18:00/17:00 UTC on a half day
+  #
+  # The first 30 minutes of the cash session are avoided (bots/assets/US500.md section 5, the
+  # opening-range window), which is what open_delay_minutes declares.
+  snapshot: us_cash_open_and_close
+  open_delay_minutes: 30
+  # Measured 2026-09-05 on server Exness-MT5Trial7 (demo): the server clock is UTC+0 all year
+  # (ServerClock.measure on BTCUSDm: offset 0), so the server clock does NOT follow New York
+  # DST and follows_dst_of is null - that field is about the clock.
+  server_clock:
+    utc_offset_minutes: 0
+    measured_at: "2026-09-05T12:48:33+00:00"
+    follows_dst_of: null
+  # The TRADING HOURS of these two index CFDs are a separate fact from the server clock, and
+  # they DO follow New York DST. Counted on the H1 bars of US500 (2022-10-25 .. 2026-09-04):
+  # November-March carry a 21:00 UTC bar and no 22:00 bar (the daily Globex break is
+  # 22:00-23:00 UTC), April-October the reverse (break 21:00-22:00 UTC). The 21:00 bar first
+  # appears 2023-11-06 and last 2026-03-06, which is the US DST calendar. sessions_mt5.json
+  # is an eight-week summer snapshot and must not be used to hard-code this.
+  # 01_feasibility_analysis asserts this on the bars on every run.
+  trade_hours_follow_dst_of: America/New_York
+  # Largest distance (minutes) allowed between the decision bar's close and the declared
+  # snapshot instant: one H1 bar. exness_fx_d1 uses 240 because its bar is H4.
+  session_close_tolerance_minutes: 60
+  execution_delay: next_bar_open
+  # The smallest share of a fold block's symbol-sessions that must carry BOTH a fill and a
+  # label, per spec, for that block to be modelled. Declared 2026-09-08 (second pass) before
+  # any model is fitted, as a design decision and not a trial: it fixes in advance how thin a
+  # block this bot will accept rather than letting the answer be chosen after the fact.
+  #
+  # The intraday spec is at 100% in every block. The overnight spec measures train
+  # 84.2 / 79.8 / 67.2 % and validation 100 / 92.7 / 79.8 % on folds 0/1/2, because the index
+  # shut for the weekend AT the Friday cash close until 2025 and because the 2022-2023 daily
+  # break sat on the cash close. 0.60 is below every one of those and above the 2022 stub
+  # (2.1 % fillable), which is what the floor is for: it admits the sample that exists and
+  # would refuse a block like 2022. 01_feasibility_analysis asserts it fold by fold.
+  min_fill_coverage: 0.60
+  # The venue calendar that decides which session a bar belongs to and where the cash session
+  # opens and closes, including half-days. A day the NYSE is shut has no cash session, so the
+  # bot has no row and places no order even though Exness quotes the CFD.
+  session_calendar: NYSE
+
+# Engine-level execution defaults. Single source of truth - Ch16-19 notebooks read these via
+# get_backtest_config(); never declare a local INITIAL_CASH or share_type constant.
+execution:
+  initial_cash: 100_000
+  # FRACTIONAL, unlike exness_fx_d1's `integer`. trade_contract_size is 1 on both indices, so
+  # one unit is one index point of exposure: $7,707 of US500 and $29,550 of USTEC at the
+  # 2026-09-08 quote. With integer units and 100,000 of cash the engine could hold at most
+  # three units of USTEC, which quantizes every weight beyond use. The live adapter is the
+  # place the quantity becomes tradable: MT5Broker.normalize_lot rounds down to volume_step
+  # 0.01 and refuses anything below volume_min (0.14 lot US500, 0.05 lot USTEC).
+  # AWAITING USER APPROVAL (bots/exness_usidx_sess/BOT.md, Draft for the user).
+  share_type: fractional
+  allocator_lookback: 63    # a quarter of cash sessions
+
+mapping:
+  # Two instruments cannot be ranked against each other. Each symbol is compared with its own
+  # score distribution, so both, one or neither can be held on a session.
+  class: time_series_threshold
+  position_state_space: long_short
+  entry_logic: threshold_on_own_score
+  sizing: equal_weight
+
+costs:
+  class: material
+  components: [spread, commission, swap]
+  # Quoted spread in basis points of mid per crossing, measured 2026-09-08 from 30 days of
+  # COPY_TICKS_INFO ticks (2026-08-08 23:01 .. 2026-09-07 23:01 UTC; 2,793,882 US500 ticks and
+  # 19,692,203 USTEC ticks) on this demo account with bots/_shared/costs_mt5.py; table in
+  # ML4T_DATA_PATH/mt5/spreads_by_session.{parquet,json}, tool
+  # bots/exness_usidx_sess/tools/measure_index_costs.py.
+  #
+  # SUPERSEDED IN PART, see the corrected block below. The tick measurement's own finding -
+  # that within its own thirty-day window the index spread is a FIXED markup in points, not a
+  # session-conditional one - still holds for that window. What it cannot see, and what the
+  # H1 tape does see, is that the size of that markup changed by about four times in 2024-10.
+  # The old finding: on this account the index spread is a FIXED markup in
+  # points, not a session-conditional one. US500 quotes 40 points (p50) to 51 points (p90) of
+  # a 0.01 point, i.e. $0.40-$0.51 on a 7,707 index; USTEC quotes 112 points (p50).
+  # SUPERSEDED 2026-09-08 (third pass), mentor review of phase 5: the words "112 points FLAT"
+  # that stood here are wrong and were quoted downstream. The tick record's own window shows a
+  # spread of 112 points at the median and 127 at the p90 (see spread_bps_by_year below, which
+  # reproduces the tick window from the H1 tape), so USTEC is not flat - it has a p50/p90 gap
+  # like US500 does, and any statement resting on "flat" has to be re-read at 127.
+  # The bps figure moves with the index level, not with the session,
+  # and the us_cash / edge_open / edge_close buckets read the same as the 24-hour figure.
+  # That is a fact about this broker, not a general one; re-measure on the real account.
+  # ------------------------------------------------------------------------------------------
+  # CORRECTED 2026-09-08 (second pass), after a mentor review of phases 0-2. The block that
+  # stood here declared indices: [0.52, 0.66] from a THIRTY-DAY tick window, and it was wrong
+  # for the backtest by a factor of about four over half of the development sample.
+  #
+  # What the tick window says is true of the window it measured. What it cannot say is what the
+  # spread was in 2023. The `spread` field of this account's own H1 bars (data/mt5/1h.parquet,
+  # 45,107 bars, the same account and the whole history) can, and it is comparable: over exactly
+  # the tick window (2026-08-08 23:00 .. 2026-09-07 23:00 UTC, 460 bars per symbol) the tape
+  # reproduces the tick measurement for US500 to the point (p50 40, p90 51) and gives USTEC
+  # p50 112 / p90 127 against the tick record's "112 flat", so the tape is the tick measurement
+  # extended backwards, not a different instrument.
+  #
+  # Read at the bars this bot actually FILLS on (exec_ts of both specs), DEVELOPMENT ONLY
+  # (2022-10-25 .. 2026-02-28, 2,848 execution bars), the p90 quoted spread per crossing is:
+  #
+  #             US500 intraday   US500 overnight   USTEC intraday   USTEC overnight
+  #   2022        3.39 bps          3.05 bps          3.30 bps         2.93 bps
+  #   2023        3.89              3.91              3.45             3.20
+  #   2024        3.22              3.32              2.92             2.96
+  #   2025        0.94              0.98              0.87             0.87
+  #   2026 (dev)  0.93              1.05              0.85             0.85
+  #
+  # There is a REGIME BREAK in 2024-10: US500 goes from a median 156 points to 53 inside that
+  # month and USTEC from 507 to 174, and both stay there. So the sample this bot is fitted and
+  # backtested on contains two cost regimes that differ by about four times, and the engine can
+  # charge only one number (case_studies/utils/backtest_presets.py overwrites the preset's
+  # commission and slippage rates with the pair this block resolves to).
+  #
+  # The declaration therefore takes the WORST regime still inside the backtest sample, at the
+  # hours this bot crosses in. Charging the recent regime's 0.66 bps would under-price every
+  # trade before 2024-11 - the whole of
+  # fold 2's training block, most of fold 1's and all of the warmup - and under-pricing costs is
+  # the one direction a backtest may not err in. Moving universe.history_start to 2024-10-01
+  # would keep 0.66 honest but leaves 1.4 years, which does not carry three folds.
+  #
+  # The consequence is stated rather than hidden: every trade after 2024-10 is charged about
+  # four times what it would have cost, so a result that survives here survives a cost the
+  # recent regime does not impose. backtest.sweep.cost_grid_bps re-scores the same returns down
+  # to 0 bps, and the phase-5 report shows both the declared cost and the recent-regime cost.
+  #
+  # AWAITING USER APPROVAL. Also to re-measure on the real Pro account before 16_costs.
+  spread_bps:
+    # [p50, p90] over the DEVELOPMENT window at the six hours this bot crosses in (14, 15, 17,
+    # 18, 20, 21 UTC: the bars opening at the two decision instants, in both DST regimes and on
+    # a half day). The stages charge the top.
+    #
+    # p50 = the worse of the two symbol medians (US500 3.069, USTEC 2.709).
+    # p90 = the worst symbol-MONTH p90 in the sample (US500 2023-10 at 4.043), not the worst
+    #       symbol-YEAR p90 (3.90) the first correction used. A yearly quantile hides a bad
+    #       month inside a good year, and bots/exness_usidx_sess/tests/test_data_quality.py
+    #       rejected the yearly figure on exactly that: US500's own median at these hours is
+    #       3.069, above the 2.86 that was declared as a p50.
+    # For reference the sample-wide p90 at these hours is US500 3.644 / USTEC 3.138; the
+    # declaration is above both, deliberately.
+    indices: [3.07, 4.05]
+  # Measured [p50, p90] in bps of mid per crossing, from the `spread` field of the H1 execution
+  # bar, per year and per spec, DEVELOPMENT ONLY. This is the table the block above is derived
+  # from and the one 01_feasibility_analysis reproduces and asserts against on every run.
+  spread_bps_by_year:
+    measured_on: "2026-09-08"
+    source: "data/mt5/1h.parquet `spread` field at exec_ts; development rows only"
+    execution_bars: 2848
+    regime_break: "2024-10"
+    US500:
+      intraday:  {2022: [3.30, 3.39], 2023: [3.32, 3.89], 2024: [3.10, 3.22], 2025: [0.91, 0.94], 2026: [0.92, 0.93]}
+      overnight: {2022: [3.05, 3.05], 2023: [3.75, 3.91], 2024: [3.17, 3.32], 2025: [0.93, 0.98], 2026: [1.04, 1.05]}
+    USTEC:
+      intraday:  {2022: [3.03, 3.30], 2023: [3.07, 3.45], 2024: [2.84, 2.92], 2025: [0.83, 0.87], 2026: [0.78, 0.85]}
+      overnight: {2022: [2.93, 2.93], 2023: [3.09, 3.20], 2024: [2.85, 2.96], 2025: [0.84, 0.87], 2026: [0.83, 0.85]}
+    # The regime the bot would trade in today, kept separately because it is what the LIVE
+    # breakeven has to clear and what the phase-5 report re-scores against. It is NOT what the
+    # backtest charges.
+    recent_regime_p90: {US500: 1.05, USTEC: 0.87}
+    # The same two statistics the declaration is taken from, at the execution hours, over the
+    # whole development window - so the gap between what is charged and what the sample
+    # typically quoted is on the record rather than inferred.
+    execution_hours_utc: [14, 15, 17, 18, 20, 21]
+    execution_hour_p50: {US500: 3.069, USTEC: 2.709}
+    execution_hour_p90: {US500: 3.644, USTEC: 3.138}
+    worst_symbol_month_p90: {US500: 4.043, USTEC: 3.286}
+    worst_month: "2023-10"
+    recent_regime_from: "2024-11-01"
+  # DECLARED 2026-09-08 (third pass), BEFORE the corrected phase-5 re-scoring was run, after a
+  # mentor review found that phase 5 charged 4.05 bps a crossing over a scoring window that lies
+  # almost entirely AFTER the 2024-10 break, i.e. about 4 to 4.9 times the cost its own
+  # evaluation window measured. It introduces NO new number. Both rates and the boundary date
+  # were already declared above, before any model was fitted; this block only says which of them
+  # applies to which session, in a form a program can read.
+  #
+  # It applies ONLY where the charge can be per session - the vectorised phase-5 report, which
+  # joins a rate per (symbol, session) in case_studies/exness_usidx_sess/_sweep.py. The BACKTEST
+  # still charges one number for the whole window and that number is still the conservative
+  # spread_bps.indices[-1], so every registered backtest_runs row, and any window that spans the
+  # break, is charged the conservative rate.
+  spread_bps_charge_rule:
+    declared_on: "2026-09-08"
+    # = spread_bps_by_year.recent_regime_from, restated here so the rule is self-contained. The
+    # break is inside 2024-10 (spread_bps_by_year.regime_break); a session in the break month
+    # itself cannot be assigned to either regime, so it is charged the conservative rate and the
+    # first session charged the post-break rate is the first of the following month.
+    post_break_from: "2024-11-01"
+    # Sessions BEFORE post_break_from - the pre-break regime and the break month itself:
+    # spread_bps.indices[-1] = 4.05, the worst symbol-month p90 of the whole development sample
+    # (US500 2023-10 at 4.043, spread_bps_by_year.worst_month above), which is a pre-break month,
+    # so it is that regime's own conservative rate as well as the sample-wide one.
+    pre_break_bps: from_spread_bps_indices_p90
+    # Sessions ON OR AFTER post_break_from: spread_bps_by_year.recent_regime_p90, per SYMBOL -
+    # US500 1.05, USTEC 0.87, the worst of that symbol's 2025 and 2026 year p90s at the
+    # execution hours over both specs. Declared above as "what the phase-5 report re-scores
+    # against", which is exactly what this rule makes it do.
+    post_break_bps: from_recent_regime_p90
+    # A symbol with no declared post-break rate is a refusal, not a default: the report stops
+    # rather than charge a rate nobody measured.
+    unknown_session: refuse
+  # The 30-day tick measurement, KEPT AS A RECORD and no longer the cost declaration. Two things
+  # are wrong with using it here, and both are recorded rather than quietly dropped:
+  #   (a) its window, 2026-08-08 .. 2026-09-07, lies inside and just after the declared holdout
+  #       (2026-03-01 .. 2026-08-31). Reading it to set a cost the backtest charges is a known
+  #       crossing of the evidence boundary; the declaration above comes from development rows
+  #       only, which removes the crossing for the number that matters.
+  #   (b) the `edge_close` bucket does not contain the overnight spec's fill minute at all.
+  #       bots/_shared/sessions.py tests `start <= t < end`, so edge_close is 15:30-15:59:59 New
+  #       York, while the overnight order fills on the bar OPENING at the cash close, 16:00-17:00
+  #       New York. Mapping overnight -> edge_close addressed the wrong half hour. The
+  #       replacement reads the execution bar itself and needs no bucket.
+  spread_bps_by_session_tick_record:
+    measured_on: "2026-09-08"
+    window: "2026-08-08 23:01 .. 2026-09-07 23:01 UTC"
+    window_days: 30
+    inside_holdout: true
+    tick_counts: {US500: 2793882, USTEC: 19692203}
+    US500:
+      all:        [0.52, 0.66]
+      us_cash:    [0.52, 0.66]
+      edge_open:  [0.52, 0.66]
+      edge_close: [0.52, 0.66]
+      overlap:    [0.52, 0.66]
+      london:     [0.52, 0.66]
+      new_york:   [0.52, 0.66]
+      asia:       [0.52, 0.54]
+      rollover:   [0.52, 0.54]
+    USTEC:
+      all:        [0.38, 0.39]
+      us_cash:    [0.38, 0.39]
+      edge_open:  [0.38, 0.39]
+      edge_close: [0.38, 0.39]
+      overlap:    [0.38, 0.39]
+      london:     [0.38, 0.39]
+      new_york:   [0.38, 0.39]
+      asia:       [0.38, 0.39]
+      rollover:   [0.38, 0.39]
+  # Pro account (user decision 2026-09-05): no commission; costs are spread + swap.
+  commission_per_lot: 0
+  swap:
+    source: symbol_info
+    # symbol_info.swap_rollover3days == 5 on both indices (read 2026-09-08), i.e. FRIDAY is
+    # the triple-swap night, not Wednesday as on the FX pairs of exness_fx_d1.
+    rollover3days: friday
+    measured_on: "2026-09-08"
+    # swap_mode 1 = points per lot per night. Long financing is a MATERIAL cost here, unlike
+    # the swap-free FX demo of exness_fx_d1: at point 0.01 and trade_contract_size 1,
+    # -147.4 points = -$1.474 per lot per night on a 7,707 index = -1.91 bps of notional, and
+    # -592.7 points = -$5.927 on a 29,550 index = -2.01 bps. Friday is charged three times, so
+    # a full week costs about -9.6 bps (US500) and -10.0 bps (USTEC) on a long position.
+    # A short pays nothing. The intraday label never crosses a server midnight and so never
+    # pays swap; the overnight label pays it on every long night. The backtest engine has no
+    # holding-cost model (mt5-exness-broker.md section 2), so this is booked OUTSIDE the
+    # engine with bots/_shared/costs_mt5.holding_cost_points.
+    points_per_lot_per_night:
+      US500: {long: -147.4, short: 0.0}
+      USTEC: {long: -592.7, short: 0.0}
+    contract_size: 1        # trade_contract_size on both; volume_step 0.01
+    volume_min:
+      US500: 0.14
+      USTEC: 0.05
+    volume_max:
+      US500: 1000.0
+      USTEC: 500.0
+
+backtest:
+  rebalance:
+    default:
+      min_weight_change: 0.005
+      min_trade_value: 100.0
+    benchmark:
+      min_weight_change: 0.0
+      min_trade_value: 0.0
+  sweep:
+    top_n_predictions:
+      signal: 0
+      allocation: 10
+      cost_sensitivity: 1
+      risk_overlay: 1
+    expensive_allocators_skip: false
+    # No top_k_grid: with two instruments there is nothing to rank. The signal is a threshold
+    # on each symbol's own score, dispatched to signals.py. EVERY value below is one trial in
+    # the Deflated Sharpe Ratio, and so is every SESSION_FILTER and every label.
+    # Declared here before the first model is trained; phase 5 does not add values silently.
+    threshold_grid:
+      # `fixed_threshold` on a regression score: 0.0 is the sign of the forecast. The two
+      # non-zero values ask the same model to trade only when it forecasts more than a round
+      # trip. RE-SIZED 2026-09-08 (second pass): the values [0.0002, 0.0005] were justified
+      # against a round trip of 1.32 bps taken from the superseded thirty-day tick window,
+      # and both regimes now have to be spanned. 0.0002 = 2 bps is a round trip in the
+      # post-2024-10 regime (2 x 1.05 US500, 2 x 0.87 USTEC); 0.0008 = 8 bps is a round trip
+      # at the declared p90 (2 x 3.91). Still three values, so the trial count is unchanged,
+      # and still declared before the first model is fitted.
+      fixed_threshold: [0.0, 0.0002, 0.0008]
+      # DECLARED 2026-09-08 (third pass), before the corrected sweep was run. The library's
+      # fixed_threshold long-short book puts its SHORT threshold at `1 - t`, the mirror of the
+      # long threshold about 0.5, which is right for a probability and wrong for a regression
+      # score: at 1e-3 every non-long observation is below 0.9992 and becomes a short, so the
+      # book is invested 100% of the time and is never flat. Generation 1 tested that book.
+      # `signed` puts the short threshold at `-t`: long above +t, short below -t, FLAT in the
+      # band between, which is the book bots/exness_usidx_sess/BOT.md's hypothesis describes.
+      # The value is part of the signal dict and therefore of the backtest identity.
+      # At t = 0.0 the two conventions still differ (mirror shorts everything below 1.0;
+      # signed shorts only a negative forecast) and neither is flat, because a zero threshold
+      # IS the sign of the forecast - that is what the value was declared to mean.
+      fixed_threshold_convention: signed
+      # `per_symbol_rolling_percentile`: a symbol is held when its own score is in its own
+      # top/bottom fifth of a trailing window of its own sessions.
+      per_symbol_rolling_percentile:
+        bars_per_day: 1       # one decision per session; the signals.py default of 390 is minute bars
+        long_q: 0.80
+        lookback_days: [63, 252]
+    # DECLARED 2026-09-08 (third pass), before the corrected re-scoring. A member is counted in
+    # K whatever it does - it was tried - but it is not eligible to be read as a candidate
+    # unless its book actually OPENED a position on at least this many sessions of its own
+    # scoring window. The number is not chosen from a result: it is the same 60 the phase-5
+    # report already required of the number of observations in a window before it would read a
+    # Sharpe ratio at all, moved from "sessions in the window" to "sessions with a position",
+    # which is the sample the statistic really rests on. Reported both ways so the floor's
+    # effect is visible rather than assumed.
+    min_traded_sessions: 60
+    allocators:
+      - {name: score_weighted,  method: score_weighted}
+      - {name: inverse_vol,     method: inverse_vol}
+      - {name: risk_parity,     method: risk_parity}
+      - {name: conformal_weighted, method: conformal_weighted}
+    cost_grid_bps: [0, 1, 2, 3, 5, 7, 10, 15, 20, 30, 50]
+    risk_controls:
+      position:
+        - {name: stop_loss_1pct,  type: stop_loss,     threshold: 0.01}
+        - {name: stop_loss_2pct,  type: stop_loss,     threshold: 0.02}
+        - {name: stop_loss_3pct,  type: stop_loss,     threshold: 0.03}
+        - {name: stop_loss_5pct,  type: stop_loss,     threshold: 0.05}
+        - {name: trailing_1pct,   type: trailing_stop, threshold: 0.01}
+        - {name: trailing_2pct,   type: trailing_stop, threshold: 0.02}
+        - {name: trailing_3pct,   type: trailing_stop, threshold: 0.03}
+        # A session bot's natural time exit is one session, which is what the label already
+        # encodes; these ask what holding two or three sessions would have done.
+        - {name: time_exit_2,     type: time_exit,     bars: 2}
+        - {name: time_exit_3,     type: time_exit,     bars: 3}
+        - {name: time_exit_5,     type: time_exit,     bars: 5}
+
+# The feature-specification register. Windows are counted in SESSIONS of this bot's own grid
+# (one row per symbol per cash session), not in H1 bars. The H1 history starts 2022-10-25 and
+# the earliest fold trains from 2023-03-01, which leaves about 85 sessions of warmup: every
+# window below is at most 63 so the oldest fold is dense. Longer windows are a phase-3 job and
+# come from the D1 parquet (daily_history_start 2019-07-16) joined onto the session grid at
+# the last D1 close at or before the decision instant, never from this H1 grid.
+features:
+  windows:
+    momentum: [1, 5, 10, 21, 42, 63]
+    close_to_close_volatility: [21, 63]
+    garman_klass: [21, 63]
+    zscore: 63
+    zscore_horizons: [5, 21]
+    channel: [21, 63]
+    skip_recent: 5
+    drawdown: [63]
+    rsi: [14]
+    moving_average: [21, 63]
+    range: [21, 63]
+    bollinger: 21
+    # The decomposition Chapter 8 01 (08_financial_features/01_price_volume_features.py:244)
+    # builds and bots/assets/US500.md section 10 names: the overnight and the intraday leg of
+    # each session's return, measured on this bot's own two snapshots.
+    overnight_intraday: [1, 5, 21]
+    # The 30 minutes the decision waits out (decision.open_delay_minutes): its return and its
+    # range are knowable at the decision instant and are the state the opening auction left.
+    opening_range: 1
+    # USTEC minus US500 (Ch08 03; bots/assets/USTEC.md section 7) and the rolling correlation
+    # of the two. With two instruments this is the whole cross-asset block.
+    structural: [5, 21, 63]
+    structural_exposure: 63
+    # Realized volatility inside the decision window, and inside the NYSE cash session, both
+    # summed from the one-hour log returns the panel aggregates (Ch08 s8.2; the session-bounded
+    # construction of nasdaq100_microstructure). These are the trailing windows those two
+    # series are averaged over. A 30-minute edge block cannot be resolved on an H1 grid and is
+    # recorded as a known limitation rather than approximated.
+    realized_vol: [5, 21]
+  # Windows counted in DAILY bars of data/mt5/daily.parquet, NOT in sessions of this bot's
+  # grid, and this is the whole reason the block exists. The H1 history starts 2022-10-25 and
+  # leaves 96 sessions of warmup before the earliest fold, so no H1-grid window may exceed 63.
+  # The D1 file starts 2019-07-16 (2,191 bars per index), which warms a 252-bar window more
+  # than three years before the panel opens. Verified 2026-09-08 on 26 June-2025 sessions of
+  # US500: the D1 bar dated d is exactly the 00:00-24:00 UTC aggregate of that day's H1 bars
+  # (open, high, low and close all agree to 1e-6), so it has finished printing at 00:00 UTC on
+  # d+1 and a 14:00-21:00 UTC decision on day d may read D1 bars up to and including d-1.
+  # That one-day staleness is the "lag: 1" the register declares for every d1_ family, and
+  # 03_financial_features asserts the join never reaches a bar dated on or after the decision
+  # day. Saturday and Sunday rows are dropped first: a Sunday D1 bar on this server holds only
+  # the two evening hours 22:00 and 23:00 UTC, which is not a trading day; close-to-close
+  # returns over the Monday-to-Friday subset are unaffected because they read levels.
+  daily_windows:
+    momentum: [21, 63, 126, 252]
+    volatility: [21, 63, 252]
+    moving_average: [50, 200]
+    drawdown: [252]
+    channel: [252]
+  ranked: []      # nothing to rank across two instruments; see mapping.class
+  # Rows are kept from the bar this column can first hold a value.
+  null_policy_carrier: zscore_21d
+  persistence_horizon: 21
+  redundancy_cut: 0.7
+  families:
+    - name: overnight and intraday
+      pattern: overnight_ret_*|intraday_ret_*|gap_*
+      role: signal
+      hypothesis: The two legs of an index session are different processes - the overnight leg carries the beta, the intraday leg is where mean reversion after the opening range and the closing auction live. NOTE the cut point - session_open_px is the price 30 minutes BEFORE the cash open (the open of the bar straddling it), so overnight_ret is a pre-open gap and intraday_ret includes the last half hour of pre-open
+      inputs: the H1 bars between this bot's two snapshots
+      lookback: 21
+      lag: 0
+      frame: per symbol-session
+      representation: trailing overnight and intraday returns at three horizons, and the gap
+      failure_mode: a half-day or a missing bar leaves one leg undefined and the pair of them no longer sums to the session
+    - name: opening range
+      pattern: or_ret|or_range
+      role: state
+      hypothesis: The hour straddling the cash open - the last half hour of pre-open and the first half hour of the auction working off - sets the range the rest of the session trades against
+      inputs: the H1 bar covering the NYSE cash open, which on this grid is the hour from 30 minutes before it to 30 minutes after
+      lookback: 1
+      lag: 0
+      frame: per symbol-session
+      representation: return and high-low range of the bar straddling the cash open, normalized by price; its OPEN is the price 30 minutes BEFORE the cash open, not the first traded price of the session
+      failure_mode: says nothing on a day the open is gapped through
+    - name: momentum
+      pattern: ret_*d|mom_skip_recent|accel_*
+      role: signal
+      hypothesis: An index that has moved over recent sessions keeps moving over the next one
+      inputs: session close
+      lookback: 63
+      lag: 0
+      frame: time series
+      representation: simple return, and differences between horizons
+      failure_mode: reverses at the shortest horizons
+    - name: risk-adjusted momentum
+      pattern: sharpe_*d
+      role: signal
+      hypothesis: Trend earned with less dispersion repeats more reliably
+      inputs: session log return
+      lookback: 63
+      lag: 0
+      frame: time series
+      representation: mean log return over its own dispersion, annualized, at the momentum windows of two sessions and longer
+      failure_mode: unbounded when dispersion approaches zero; the one-session member is not emitted at all, because a deviation over a single observation is undefined
+    - name: mean reversion
+      pattern: zscore_*|channel_pos_*|bollinger_pctb_*
+      role: signal
+      hypothesis: An index stretched against its own recent range comes back inside the cash session
+      inputs: session close
+      lookback: 84
+      lag: 0
+      frame: time series
+      representation: trailing z-score, position in the trailing range
+      failure_mode: a trending index sits at the edge of its channel for months
+    - name: volatility
+      pattern: vol_gk_*|vol_cc_*|vol_ratio_*
+      role: state
+      hypothesis: Dispersion sets how far a session can travel and so what a forecast is worth
+      inputs: session OHLC
+      lookback: 63
+      lag: 0
+      frame: time series
+      representation: Garman-Klass and close-to-close deviation, and the ratio of the windows
+      failure_mode: lags a shock by roughly half its window
+    - name: range and drawdown
+      pattern: max_dd_*|avg_range_*
+      role: state
+      hypothesis: How far an index sits below its peak conditions what a signal is worth
+      inputs: session OHLC
+      lookback: 63
+      lag: 0
+      frame: time series
+      representation: share below the trailing peak, mean normalized session range
+      failure_mode: says nothing about direction
+    - name: oscillator and trend
+      pattern: rsi_*|price_to_ma_*
+      role: signal
+      hypothesis: Price against its own recent path separates trend from exhaustion
+      inputs: session close
+      lookback: 63
+      lag: 0
+      frame: time series
+      representation: Wilder-smoothed oscillator, ratio to a moving average
+      failure_mode: saturates in a sustained trend
+    - name: structural spread
+      pattern: spread_ret_*|spread_corr_*
+      role: state
+      hypothesis: The tech premium (USTEC over US500) is common to both instruments and is not instrument-specific
+      inputs: both indices' session closes on the same decision instant
+      lookback: 126
+      lag: 0
+      frame: cross-asset
+      representation: return of the USTEC/US500 ratio at three horizons, and the rolling correlation of the two
+      failure_mode: the two indices correlate about 0.9, so the spread is a small residual and noisy
+    - name: session realized volatility
+      pattern: rv_window_*|rv_cash_*|rv_ratio_*
+      role: state
+      hypothesis: How much an index actually travelled between two decisions, and inside the cash session itself, sets what a one-session forecast is worth and how far it can be right
+      inputs: the one-hour log returns inside the decision window, and inside the NYSE cash session
+      lookback: 21
+      lag: 0
+      frame: per symbol-session
+      representation: root sum of squared hourly log returns over the window and over the cash session, their trailing means, and the ratio of the current window to its trailing month
+      failure_mode: an hour with no bar (a Globex break, a half day) shortens the sum and reads as calm
+    - name: daily momentum
+      pattern: d1_ret_*d|d1_accel_*
+      role: signal
+      hypothesis: A trend measured over a quarter to a year cannot be warmed up on this account's H1 history and has to be read on the daily bar, where the index has run since 2019
+      inputs: daily.parquet closes, Monday to Friday, up to the last bar whose UTC day had ended at the decision
+      lookback: 252
+      lag: 1
+      frame: time series, daily grid joined to the session grid
+      representation: simple return over 21, 63, 126 and 252 daily bars, and the difference between two of them
+      failure_mode: the daily bar is one day stale at every decision, so the freshest session is not in it
+    - name: daily risk-adjusted momentum
+      pattern: d1_sharpe_*d
+      role: signal
+      hypothesis: A trend earned with less daily dispersion repeats more reliably than one earned in a straight line up and back
+      inputs: daily.parquet log returns, Monday to Friday
+      lookback: 252
+      lag: 1
+      frame: time series, daily grid joined to the session grid
+      representation: mean daily log return over its own dispersion, annualized, at four horizons
+      failure_mode: unbounded when the dispersion of the window approaches zero
+    - name: daily volatility and regime
+      pattern: d1_vol_*d|d1_vol_ratio_*
+      role: state
+      hypothesis: The volatility regime an index sits in is a slow variable that a quarter of H1 history cannot see, and it conditions every faster signal
+      inputs: daily.parquet log returns, Monday to Friday
+      lookback: 252
+      lag: 1
+      frame: time series, daily grid joined to the session grid
+      representation: annualized close-to-close deviation at a month, a quarter and a year, and the ratio of the shortest to the longest
+      failure_mode: lags a shock by roughly half its window, and the year window barely moves
+    - name: daily trend and range
+      pattern: d1_price_to_ma_*|d1_max_dd_*|d1_channel_pos_*
+      role: state
+      hypothesis: Where the index sits against the two moving averages the whole market watches, and how far below its own year's peak, conditions what a one-session forecast is worth
+      inputs: daily.parquet closes, Monday to Friday
+      lookback: 252
+      lag: 1
+      frame: time series, daily grid joined to the session grid
+      representation: ratio to the 50 and 200 day moving average, current drawdown from the trailing year's peak, and position in the trailing year's range
+      failure_mode: says nothing about direction over one session, and the 200-day ratio changes sign only a few times a year
+    - name: calendar and season
+      pattern: dow_*|month_*|is_opex|turn_of_month
+      role: state
+      hypothesis: An index session is not exchangeable with any other - the monthly option expiry, the turn of the month and the day of the week each carry flow that trades on a clock rather than on a price
+      inputs: the session date alone
+      lookback: 1
+      lag: 0
+      frame: per session
+      representation: cyclical encodings of the weekday and the month, a third-Friday flag, and the position of the session inside its own calendar month
+      failure_mode: pure date arithmetic that knows nothing about the market, and a flag that fires 12 times a year is estimated from very few observations
+
+# Declared 2026-09-08 from data/mt5/history_depth.json and the H1 parquet, BEFORE any model is
+# trained, and never moved afterwards.
+#
+# The research grid is one row per index per NYSE cash session. H1 history starts 2022-10-25
+# on both symbols, which is 3.86 years to 2026-09-04 - a quarter of what exness_fx_d1 has, and
+# the reason the fold geometry is smaller here. Counting back from the holdout: three folds of
+# 18 months training and 6 months validation step back 6 months at a time and use
+# 2023-03-01 .. 2026-02-28 exactly, leaving 2022-10-25 .. 2023-02-28 (about 85 sessions) as
+# feature warmup, which every window in `features.windows` above (max 63) fits inside.
+#
+# The holdout is SIX months, 2026-03-01 .. 2026-08-31, not the twelve exness_fx_d1 uses: at
+# twelve months this history supports only two folds, and two validation windows is thin
+# evidence for selecting among the 43 model configurations the training menus carry. Six
+# months of a two-instrument session panel is about 250 label rows per spec, which is a small
+# holdout and is recorded as such. AWAITING USER APPROVAL (BOT.md, Draft for the user).
+evaluation:
+  n_splits: 3
+  train_size: P18M
+  val_size: P6M
+  holdout_start: '2026-03-01'
+  holdout_end: '2026-08-31'
+  calendar: NYSE
+  periods_per_year: 252
+
+# Two labels, one per snapshot, and they are disjoint: together they are the whole session.
+#
+#   fwd_ret_intraday   open of the execution bar at us_cash_open (15:00/14:00 UTC)
+#                      -> close of the last cash bar (21:00/20:00 UTC, or the half-day close)
+#                      Never crosses a server midnight, so it never pays swap.
+#   fwd_ret_overnight  open of the execution bar at us_cash_close (21:00/20:00 UTC)
+#                      -> close of the next session's decision bar (15:00/14:00 UTC)
+#                      Crosses exactly one server midnight, so a long pays one night of swap
+#                      (three on a Friday); a short pays nothing.
+#
+# Both are one session forward, so both purge one session and both rebalance every session.
+labels:
+  # WHICH PANEL EACH LABEL LIVES ON, and the reason this bot runs one experiment workspace per
+  # spec rather than one for the pair. The two labels are not two horizons on one grid, the way
+  # exness_gold_sess's fwd_ret_8h and fwd_ret_24h are: they are two different DECISION INSTANTS,
+  # so the session panel underneath them is a different aggregation of the same bars, and the
+  # feature matrices they need carry different values under the same (timestamp, symbol) key.
+  #
+  # utils/modeling.load_modeling_dataset reads exactly one features/financial.parquet per case
+  # study, so one workspace cannot hold both. Nor may the two be merged column-wise: the
+  # overnight panel's columns for session d are computed from bars up to 20:00 UTC, which is
+  # inside the intraday label's own holding period, so handing them to an intraday model would
+  # be handing it the answer. (The reverse is safe - 14:00 precedes 20:00 - which is exactly why
+  # the asymmetry has to be enforced rather than trusted.)
+  #
+  # So: `03_financial_features` builds the panel named here for whatever `labels.primary` the
+  # WORKSPACE declares, and each workspace declares one label and no variants. The mapping lives
+  # in configuration and not in a notebook parameter, so a workspace cannot end up building one
+  # spec's features and fitting the other's label.
+  spec_of:
+    fwd_ret_intraday: intraday
+    fwd_ret_overnight: overnight
+  primary: fwd_ret_intraday
+  buffer: 1D
+  variants:
+    - fwd_ret_overnight
+  variant_buffers:
+    fwd_ret_overnight: 1D
+  rebalance_step:
+    fwd_ret_intraday: 1
+    fwd_ret_overnight: 1
+
+modeling:
+  gbm:
+    libraries: [lightgbm]
+    preset: default
+    device: cpu
+    max_bin: 255
+    # WSL2 on this machine: LightGBM needs LD_LIBRARY_PATH=~/omp and two threads
+    # (bots/exness_fx_d1/BOT.md, phase 4).
+    num_threads: 2
+
+causal:
+  treatment: mom_skip_recent
+  # `close.shift(skip_recent) / close.shift(momentum[-1]) - 1` in 03_financial_features, which
+  # here is 5 and 63. The lookback is 63 sessions, the oldest price it reads; the return
+  # interval is 58 sessions; consecutive values overlap in 57 of them. The declaration takes
+  # the lookback because it is the larger, so a placebo block of this length spans the
+  # dependence whichever way the arithmetic is read.
+  treatment_window: 63
+  confounders: [vol_gk_21d, vol_gk_63d, zscore_21d]
+  method: walk_forward_dml

@@ -1,0 +1,72 @@
+# Model configurations for fwd_ret_24h (exness_btc_8h).
+# Each entry references a preset in case_studies/config/{model_type}/.
+# Comment out lines to skip configs; add new preset names to extend.
+#
+# DECLARED 2026-09-08, NOT RUN. Phases 0-3 of this bot stop before 06_linear, because the
+# Hypothesis and Kill criteria of bots/exness_btc_8h/BOT.md are still blank and no trial may
+# be counted before the user approves a falsification line. 28 linear + 15 GBM = 43
+# CONFIGURATIONS per label, but a CONFIGURATION is not a PREDICTION SET: every case_studies/
+# config/lgb/*.yaml preset this menu's `gbm:` entries resolve to declares
+# `checkpoint_interval: 50, max_iterations: 500`, i.e. 10 checkpoints, and each checkpoint is
+# its own prediction_hash (case_studies/research/model_planning.py::checkpoint_schedule) - so
+# 07_gbm publishes 15 x 10 = 150 prediction sets a label, not 15. Linear presets declare no
+# checkpoint_interval (one "final" checkpoint each), so 06_linear publishes 28. CORRECTED
+# 2026-09-10 (bots/exness_btc_8h/BOT.md Decisions log, coordinator-flagged before any fork):
+#   prediction sets/label = 28 + 150 = 178 (NOT 43)
+#   phase-4 total (2 labels)          = 356 (NOT 86 - this is what R1 counts against)
+#   K5 (phase-5 backtest specs)       = 178 x 2 labels x 3 session books x 2 signal specs
+#                                      = 2,136 (NOT 516)
+# Precedent for the same arithmetic on this account: bots/exness_gold_sess/BOT.md phase 4
+# ("15 configs x 10 checkpoints x 2 labels = 300 sets"), reviews.jsonl 2026-09-10
+# (exness_fx_d1 generation-2 K=2,136 from the identical checkpoint-expansion pattern).
+#
+# deep_learning, tabular_dl and causal_dml are DELIBERATELY ABSENT rather than commented out.
+# WSL2 on this host has 3.8 GB of RAM and 8 logical CPUs (bots/exness_fx_d1/BOT.md open
+# question 4), and every extra family multiplies K by the number of presets it adds while the
+# Deflated Sharpe divides by the total. They are a later generation and one more block of
+# trials, declared when they are first run.
+linear:
+- ols
+- ridge_a0.001
+- ridge_a0.01
+- ridge_a0.1
+- ridge_a1.0
+- ridge_a10.0
+- ridge_a100.0
+- ridge_a1000.0
+- ridge_a10000.0
+- ridge_a100000.0
+- ridge_a1000000.0
+- ridge_a10000000.0
+- lasso_f0.5
+- lasso_f0.2
+- lasso_f0.08
+- lasso_f0.03
+- lasso_f0.015
+- lasso_f0.35
+- lasso_f0.7
+- lasso_f0.85
+- enet_f0.5
+- enet_f0.2
+- enet_f0.08
+- enet_f0.03
+- enet_f0.015
+- enet_f0.35
+- enet_f0.7
+- enet_f0.85
+gbm:
+- default_mse
+- default_mae
+- default_huber
+- leaves_7_mse
+- leaves_7_mae
+- leaves_7_huber
+- leaves_15_mse
+- leaves_15_mae
+- leaves_15_huber
+- leaves_31_mse
+- leaves_31_mae
+- leaves_31_huber
+- leaves_63_mse
+- leaves_63_mae
+- leaves_63_huber

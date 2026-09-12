@@ -1,0 +1,279 @@
+---
+symbol: XAUUSD
+asset_class: metals
+bot: exness_gold_sess
+template_case_study: "fx_pairs pipeline + mô hình chuỗi thời gian từng tài sản (Ch16 04, 05)"
+timezone: UTC
+sessions:
+  london:
+    winter: "08:00-17:00"
+    summer: "07:00-16:00"
+  overlap:
+    winter: "13:00-17:00"
+    summer: "12:00-16:00"
+  new_york:
+    winter: "13:00-22:00"
+    summer: "12:00-21:00"
+  tokyo:
+    winter: "00:00-09:00"
+    summer: "00:00-09:00"
+decision_times:
+  - name: "Quyết định 1"
+    when: "Đầu phiên London: 08:00 UTC mùa đông (07:00 mùa hè), sau block mép phiên 30 phút"
+  - name: "Quyết định 2"
+    when: "Đầu phiên New York: 13:00 UTC mùa đông (12:00 mùa hè), hoặc 14:00 sau cửa sổ tin 13:30"
+  - name: "Thoát"
+    when: "Ba nhãn: đóng cuối phiên, giữ qua đêm cộng swap, triple-barrier trong phiên"
+  - name: "Backtest theo phiên (mức 2)"
+    when: "`SESSION_FILTER` trong stage backtest: london, ny, overlap"
+avoid_windows:
+  - name: "Giờ đầu tuần"
+    when: "22:00-23:00 UTC Chủ nhật (mùa hè 21:00-22:00)"
+  - name: "Giờ cuối tuần"
+    when: "2 giờ cuối thứ Sáu trước giờ đóng"
+  - name: "Rollover"
+    when: "±15 phút quanh giờ rollover"
+  - name: "Nghỉ hằng ngày Globex"
+    when: "22:00-23:00 UTC mùa đông (21:00-22:00 mùa hè)"
+  - name: "Trước và sau NFP, CPI, FOMC"
+    when: "±30 phút"
+news:
+  - name: "LBMA gold price"
+    when: "10:30 UTC và 15:00 UTC"
+  - name: "Số liệu Trung Quốc và giờ Thượng Hải"
+    when: "01:30-03:00 UTC"
+  - name: "Lợi suất thực Mỹ (TIPS 10 năm)"
+    when: "Liên tục"
+  - name: "NFP"
+    when: "thứ Sáu đầu tháng 13:30 UTC (mùa hè 12:30)"
+  - name: "CPI Mỹ"
+    when: "giữa tháng 13:30 UTC (mùa hè 12:30)"
+  - name: "FOMC"
+    when: "8 lần/năm, quyết định 19:00 UTC, họp báo 19:30 (mùa hè 18:00/18:30)"
+  - name: "Đơn xin trợ cấp thất nghiệp"
+    when: "thứ Năm 13:30 UTC"
+  - name: "ISM PMI"
+    when: "ngày làm việc đầu tháng 15:00 UTC (mùa hè 14:00)"
+  - name: "Bán lẻ, GDP"
+    when: "13:30 UTC"
+verify_on_mt5: [symbol_info.trade_contract_size, volume_min, volume_step, swap_long, swap_short, swap_rollover3days, symbol_info_session_trade]
+---
+
+# XAUUSD — hồ sơ phiên và giờ giao dịch
+
+**Lớp tài sản**: metals · **Bot**: `exness_gold_sess` · **Khuôn case study**: fx_pairs pipeline + mô hình chuỗi thời gian từng tài sản (Ch16 04, 05)
+
+**Vai trò trong danh mục**: Tài sản trú ẩn; chạy theo lãi suất thực Mỹ, USD và dòng tiền ETF; nhạy tin Mỹ
+
+**Hợp đồng**: 100 oz mỗi lot (xác minh `trade_contract_size`)
+
+## 1. Giờ giao dịch
+
+Tài sản cơ sở giao dịch theo CME Globex: 23:00 UTC Chủ nhật đến 22:00 UTC thứ Sáu, nghỉ hằng ngày 22:00-23:00 UTC (mùa hè sớm hơn 1 giờ). CFD trên Exness thường theo sát lịch này, có thể lệch vài phút; đọc từ `symbol_info_session_trade` và ghi vào `sessions.py`.
+
+## 2. Các phiên (UTC)
+
+| Phiên | Mùa đông | Mùa hè | Ghi chú |
+|---|---|---|---|
+| `london` | 08:00-17:00 | 07:00-16:00 | Phiên thanh khoản lớn nhất của FX và kim loại |
+| `overlap` | 13:00-17:00 | 12:00-16:00 | London giao New York: spread hẹp nhất, biên độ lớn nhất |
+| `new_york` | 13:00-22:00 | 12:00-21:00 | Tin Mỹ 13:30, FOMC 19:00 (mùa đông) |
+| `tokyo` | 00:00-09:00 | 00:00-09:00 | Không có DST |
+
+Mùa đông là khoảng đầu tháng 11 đến giữa tháng 3 (giờ chuẩn Mỹ và Anh). Mùa hè sớm hơn một giờ. Tokyo không đổi giờ. `bots/_shared/sessions.py` tính từ múi giờ thật, không hard-code bảng này.
+
+## 3. Lịch tin và sự kiện định kỳ
+
+| Sự kiện | Thời điểm | Ảnh hưởng |
+|---|---|---|
+| LBMA gold price | 10:30 UTC và 15:00 UTC | Mốc thanh khoản; tăng khối lượng quanh giờ này |
+| Số liệu Trung Quốc và giờ Thượng Hải | 01:30-03:00 UTC | Nhu cầu vật chất; biên độ phiên Á |
+| Lợi suất thực Mỹ (TIPS 10 năm) | Liên tục | Động lực chính (Ch08 04, FRED) |
+| NFP | thứ Sáu đầu tháng 13:30 UTC (mùa hè 12:30) | Biến động lớn nhất tháng cho USD, vàng, chỉ số |
+| CPI Mỹ | giữa tháng 13:30 UTC (mùa hè 12:30) | Lãi suất thực; vàng và USTEC phản ứng mạnh |
+| FOMC | 8 lần/năm, quyết định 19:00 UTC, họp báo 19:30 (mùa hè 18:00/18:30) | Cửa sổ 2 giờ spread giãn trên mọi tài sản USD |
+| Đơn xin trợ cấp thất nghiệp | thứ Năm 13:30 UTC | Nhỏ, nhưng đều đặn |
+| ISM PMI | ngày làm việc đầu tháng 15:00 UTC (mùa hè 14:00) | Chỉ số và USD |
+| Bán lẻ, GDP | 13:30 UTC | Chỉ số |
+
+## 4. Rollover và swap
+
+Swap tính tại giờ rollover của server (thường quanh 22:00 UTC mùa đông, 21:00 mùa hè; xác minh trên tài khoản). Ngày swap ba lần đọc từ `symbol_info(...).swap_rollover3days` (thường thứ Tư cho FX và kim loại). Spread giãn 15 đến 30 phút quanh rollover; không đặt lệnh thị trường trong cửa sổ này.
+
+## 5. Giờ nên tránh vào lệnh thị trường
+
+| Cửa sổ | Thời gian | Lý do |
+|---|---|---|
+| Giờ đầu tuần | 22:00-23:00 UTC Chủ nhật (mùa hè 21:00-22:00) | Gap cuối tuần, spread giãn, thanh khoản mỏng |
+| Giờ cuối tuần | 2 giờ cuối thứ Sáu trước giờ đóng | Đóng vị thế của các quỹ, spread giãn, rủi ro gap sang thứ Hai |
+| Rollover | ±15 phút quanh giờ rollover | Spread giãn, swap tính |
+| Nghỉ hằng ngày Globex | 22:00-23:00 UTC mùa đông (21:00-22:00 mùa hè) | Không có giá; lệnh chờ không khớp; gap nhỏ khi mở lại |
+| Trước và sau NFP, CPI, FOMC | ±30 phút | Spread giãn 3-5 lần; chỉ vào lệnh nếu nhãn được thiết kế cho cửa sổ tin |
+
+Tránh ở đây nghĩa là không đặt lệnh thị trường mới, và spread trong cửa sổ đó lấy phân vị 90 khi tính chi phí. Feature vẫn được tính trên mọi nến. Một cửa sổ chỉ được đưa trở lại lịch quyết định khi backtest theo phiên chứng minh nó sống sót qua chi phí.
+
+## 6. Mốc quyết định và khớp lệnh của bot
+
+| Mốc | Thời điểm | Ghi chú |
+|---|---|---|
+| Quyết định 1 | Đầu phiên London: 08:00 UTC mùa đông (07:00 mùa hè), sau block mép phiên 30 phút | Bot `exness_gold_sess`, nến H1 |
+| Quyết định 2 | Đầu phiên New York: 13:00 UTC mùa đông (12:00 mùa hè), hoặc 14:00 sau cửa sổ tin 13:30 | Hai biến thể là hai spec backtest |
+| Thoát | Ba nhãn: đóng cuối phiên, giữ qua đêm cộng swap, triple-barrier trong phiên | Ch07 03, Ch19 02 |
+| Backtest theo phiên (mức 2) | `SESSION_FILTER` trong stage backtest: london, ny, overlap | Mỗi bộ lọc một hash; N phiên = N trial trong DSR |
+
+Quyết định luôn tại giá đóng nến, khớp ở nến kế tiếp. Mọi cửa sổ feature của bot theo phiên bị chặn tại biên phiên.
+
+## 7. Feature từ repo
+
+- Lợi suất thực và USD làm feature cấu trúc (Ch08 03, 04)
+- Tỷ số vàng/bạc
+- Momentum và mean reversion H1 chặn tại biên phiên
+- Tách lợi nhuận qua đêm và trong phiên (Ch08 01)
+- Cờ phiên và cờ mép phiên (`edge_block` như `nasdaq100_microstructure`)
+
+## 8. Bằng chứng và mẫu trong repo
+
+- GC trong `case_studies/cme_futures/config/setup.yaml`
+- GLD và IAU trong `case_studies/etfs`
+- `02_financial_data_universe/05_futures_session_aggregation.py` — ranh giới phiên CME
+
+## 9. Tương quan và vị trí trong danh mục
+
+Tương quan dương với AUDUSD và XAGUSD, nghịch với USD.
+
+## 10. Ghi chú riêng
+
+Vàng là tài sản mà backtest theo phiên có ý nghĩa nhất trong 10 cặp: biên độ và spread khác hẳn giữa phiên Á, London và NY.
+
+## 11. Xác minh trên tài khoản Exness trước khi dùng
+
+```python
+import MetaTrader5 as mt5
+mt5.initialize()
+s = "XAUUSD"  # đổi sang tên đúng trong Market Watch
+info = mt5.symbol_info(s)
+print(info.trade_contract_size, info.volume_min, info.volume_step, info.volume_max,
+      info.swap_long, info.swap_short, info.swap_rollover3days, info.spread, info.digits)
+for day in range(7):
+    i = 0
+    while (sess := mt5.symbol_info_session_trade(s, day, i)) is not None:
+        print(day, sess); i += 1
+rates = mt5.copy_rates_from_pos(s, mt5.TIMEFRAME_D1, 0, 100000)
+print('D1 bars:', len(rates), 'from', rates[0]['time'] if len(rates) else None)
+```
+
+Kết quả đo được ghi đè lên mọi con số ước lượng trong file này. Cập nhật file khi Exness đổi giờ hoặc điều kiện hợp đồng.
+
+## 12. Measured on this account (2026-09-05)
+
+Đo trực tiếp từ terminal MT5 đang đăng nhập (server `Exness-MT5Trial7`, tài khoản **demo**, loại tài khoản **Pro**, tiền tài khoản USD), ngày 2026-09-05, bằng `bots/_shared/mt5_loader.py` và `bots/_shared/costs_mt5.py`. Nguồn: `ML4T_DATA_PATH/mt5/history_depth.json`, `sessions_mt5.json`, `spreads_by_session.json`. Các con số dưới đây ghi đè mọi ước lượng ở các mục trên; đọc lại trên tài khoản thật trước khi giao dịch thật.
+
+| Trường | Giá trị đo được |
+|---|---|
+| Tên trong Market Watch | `XAUUSDm` (suffix `m`; `path` = `Standard\Forex\XAUUSDm`) |
+| `trade_contract_size` | 100 |
+| `volume_min` / `volume_step` / `volume_max` | 0.01 / 0.01 / 200.0 |
+| `digits` / `point` | 3 / 0.001 |
+| `swap_long` / `swap_short` (`swap_mode` 1 = points/lot/đêm) | 0.0 / 0.0 |
+| `swap_rollover3days` | 3 = Wednesday (swap x3) |
+| Tiền tệ base / profit / margin | XAU / USD / XAU |
+| Giờ server | UTC+0 quanh năm (đo `ServerClock.measure` trên `BTCUSDm`: offset 0; tuần FX mở Sun 22:00 server tháng 1 và Sun 21:00 server tháng 7, tức server **không** theo DST New York). Nến D1 đóng 00:00 UTC |
+| Lịch sử D1 | 3,892 nến, 2014-01-14 → 2026-09-04 |
+| Lịch sử H4 | 16,148 nến, 2014-01-14 → 2026-09-04 |
+| Lịch sử H1 | 22,838 nến, 2022-10-25 → 2026-09-04 |
+| `terminal_info.maxbars` | 100000 (loader tải theo chunk) |
+
+**Giờ giao dịch (giờ server = UTC), suy ra từ nến H1 của 8 tuần gần nhất** (package Python `MetaTrader5` không có `symbol_info_session_trade`, hàm đó chỉ có trong MQL5; đoạn mã ở mục 11 vì vậy không chạy được nguyên văn):
+
+- mon: 00:00–21:00, 22:00–24:00; tue: 00:00–21:00, 22:00–24:00; wed: 00:00–21:00, 22:00–24:00; thu: 00:00–21:00, 22:00–24:00; fri: 00:00–21:00; sat: đóng; sun: 22:00–24:00
+
+## 12b. Spread theo phiên — đo 2026-09-07
+
+Đo bằng `bots._shared.costs_mt5.measure_spreads(["XAUUSD"], days=30, mt5)` (script:
+`bots/exness_gold_sess/tools/measure_metals_costs.py`), **30 ngày** tick `COPY_TICKS_INFO`,
+cửa sổ **2026-08-08 15:50 → 2026-09-07 15:50 UTC**, `measured_at_utc = 2026-09-07 15:50:46`,
+server UTC+0. Tổng **6,411,481 tick**. Spread = `(ask − bid) / mid × 1e4` (bps), điểm =
+`(ask − bid) / point` với `point = 0.001`. Nguồn ghi lại:
+`ML4T_DATA_PATH/mt5/spreads_by_session.{json,parquet}` (5 cặp FX của `exness_fx_d1` giữ nguyên;
+bản sao lưu trước khi ghi: `*.bak_2026-09-07`) và `mt5/symbol_info_metals_2026-09-07.json`.
+
+| Bucket | n_ticks | p50 (bps) | p90 (bps) | mean (bps) | p50 (points) | p90 (points) |
+|---|---|---|---|---|---|---|
+| all | 6,411,481 | 0.59 | 0.60 | 0.585 | 260 | 260 |
+| rollover (±15′ quanh 00:00 server) | 138,100 | 0.58 | 0.60 | 0.583 | 260 | 260 |
+| overlap (London × New York) | 1,987,096 | 0.59 | 0.60 | 0.587 | 260 | 260 |
+| london | 1,061,077 | 0.59 | 0.60 | 0.584 | 260 | 260 |
+| new_york | 1,082,981 | 0.58 | 0.60 | 0.583 | 260 | 260 |
+| asia | 2,142,227 | 0.59 | 0.60 | 0.585 | 260 | 260 |
+| other | **0 tick** | — | — | — | — | — |
+
+Đọc bảng này:
+
+- Spread **tính theo điểm là hằng số 260 điểm (0.260 USD) ở mọi bucket và mọi phân vị** trong suốt
+  30 ngày. Dao động nhỏ ở cột bps (0.58 → 0.60) chỉ do giá vàng thay đổi (mid ≈ 4,300–4,500),
+  không phải spread giãn theo phiên. Trên tài khoản Pro này vàng **không** có phiên nào rẻ hơn
+  hay đắt hơn.
+- Bucket `other` **rỗng**: khoảng nghỉ 21:00–22:00 UTC (giờ hè Mỹ) là lúc XAUUSDm dừng báo giá
+  (kiểm chứng trên `1h.parquet`: tháng 8/2026 có nến giờ 20, 22, 23 nhưng không có giờ 21, trong khi
+  EURUSD có đủ), và Sydney mở lúc 22:00 UTC trong mùa AEST nên mọi tick sau đó đã thuộc `asia`.
+  Vì vậy vàng **không** có bucket ngoài phiên đắt như 5 cặp FX (p90 4.3–9.5 bps).
+- Chi phí vòng (round trip) cho cổng chi phí phase 1: **2 × 0.60 = 1.2 bps**
+  (commission 0 trên tài khoản Pro; swap đo được 0.0/0.0). So với biên độ phiên thực hiện,
+  xem `bots/exness_gold_sess/data_census_2026-09-07.md` mục 6.
+
+Bổ sung các trường `symbol_info` đọc lại ngày 2026-09-07 (những trường mục 12 chưa có):
+
+| Trường | Giá trị |
+|---|---|
+| `description` | Gold vs US Dollar |
+| `trade_tick_size` / `trade_tick_value` | 0.001 / 0.1 USD |
+| `spread` (tại lúc đọc) / `spread_float` | 260 điểm / True |
+| `trade_stops_level` / `trade_freeze_level` | 0 / 0 |
+| `trade_mode` / `trade_calc_mode` / `filling_mode` | 4 (full) / 0 (forex) / 3 (FOK\|IOC) |
+| `swap_mode` | 1 (points per lot per night) |
+
+Mọi con số ở mục 12 (contract 100, volume 0.01/0.01/200, digits 3, point 0.001, swap 0.0/0.0,
+`swap_rollover3days` 3, base/profit/margin XAU/USD/XAU) được đọc lại ngày 2026-09-07 và **không đổi**.
+Vẫn là tài khoản **demo** `206539306 @ Exness-MT5Trial7`; phải đo lại trên tài khoản thật trước `16_costs`.
+
+## 12c. Độ sâu H1 đo lại bằng đường COUNT-BASED — 2026-09-07 (task B0)
+
+**Con số "H1 chỉ có từ 2022-10-25" ở mục 12 là artefact của loader, không phải giới hạn của tài khoản.**
+Cùng terminal, cùng login `206539306 @ Exness-MT5Trial7`, cùng ngày, hai cách hỏi cho hai câu trả lời:
+
+| Cách hỏi | Hàm | Kết quả XAUUSD H1 |
+|---|---|---|
+| Theo **khoảng lịch**, chia chunk | `mt5_loader._copy_rates_chunked` → `copy_rates_range` | **22,838 nến, 2022-10-25 → 2026-09-04** (mục 12) |
+| Theo **số nến**, epoch seconds | `mt5_loader._copy_rates_deep` → `copy_rates_from` | **57,094 nến, 2014-01-14 → 2026-09-04** |
+
+Nguyên nhân: MT5 chỉ nạp lịch sử vào cache biểu đồ khi được yêu cầu; `copy_rates_range` trả về
+những nến terminal **đã đồng bộ**, còn một yêu cầu theo số nến buộc terminal kéo phần cũ hơn từ
+server. Script: `bots/exness_gold_sess/tools/deepen_metals_h1.py`; hàm dùng chung mới:
+`bots/_shared/mt5_loader.fetch_mt5_bars_deep` / `download_mt5_bars(history_mode="deep")`.
+
+**Nhưng phần trước 2017 không phải lưới H1.** Đếm nến theo tuần:
+
+| Tuần | 2017-01-30 | 2017-02-06 | 2017-02-13 | 2017-02-20 | **2017-02-27** | 2017-03-06 | 2017-03-13 |
+|---|---|---|---|---|---|---|---|
+| Số nến H1 | 6 | 6 | 6 | 6 | **113** | 120 | 117 |
+
+971 nến đầu (2014-01-14 → 2017-02-26) là **6 nến/tuần** — một tiền tố D1 được server phục vụ trên
+khung H1, không phải lưới giờ. `dense_history_start` (quy tắc `min_bars_per_week=100` của
+`experiments/xau_fx_mt5/data/build_panel.py:789`) = **2017-02-27**.
+
+| Trường | Giá trị đo được 2026-09-07 |
+|---|---|
+| H1 tổng | 57,094 nến, 2014-01-14 → 2026-09-04 |
+| H1 tiền tố thưa (6 nến/tuần) | 971 nến, 2014-01-14 → 2017-02-26 — **không dùng được** |
+| **H1 dày** | **56,123 nến, 2017-02-27 → 2026-09-04**, 2,921 ngày lịch |
+| `dense_history_start` | **2017-02-27** |
+| Đối chiếu phần chồng lấn với file cũ | 22,838 nến chung, **0 sai lệch OHLC**, 0 nến chỉ có ở file cũ |
+
+Đã ghi vào `ML4T_DATA_PATH/mt5/1h.parquet` (bản sao lưu `1h.parquet.bak_2026-09-07b`; 244,991 →
+313,495 hàng; các mã khác **so khung chính xác bằng nhau**, 199,322 hàng trước và sau) và vào
+`history_depth.json` (`history_mode: "deep"`, `dense_history_start`, `sparse_prefix_bars`).
+Cạnh phải giữ nguyên 2026-09-04 20:00 UTC để panel không lệch so với các mã FX.
+
+Hệ quả thiết kế: `exness_fx_d1` **loại H1 khỏi thiết kế** dựa trên con số 3.9 năm
+(`bots/exness_fx_d1/BOT.md:98`); con số đó sai. `exness_gold_sess` dùng nhánh A của spec phase 1:
+`universe.history_start: 2017-02-27`, 4 fold (P3Y train, P1Y val), holdout 2025-09-01 → 2026-08-31.

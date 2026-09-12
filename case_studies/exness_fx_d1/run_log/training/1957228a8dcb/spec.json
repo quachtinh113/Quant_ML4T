@@ -1,0 +1,15 @@
+{
+  "config_name": "ridge_a1000000.0",
+  "family": "linear",
+  "feature_sets": [
+    "financial",
+    "model_based"
+  ],
+  "label": "fwd_ret_21d",
+  "library": "sklearn",
+  "n_folds": 8,
+  "seed": 42,
+  "params": {
+    "alpha": 1000000.0
+  }
+}

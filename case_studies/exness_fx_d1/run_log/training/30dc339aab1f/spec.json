@@ -1,0 +1,17 @@
+{
+  "config_name": "enet_f0.35",
+  "family": "linear",
+  "feature_sets": [
+    "financial",
+    "model_based"
+  ],
+  "label": "fwd_ret_21d",
+  "library": "sklearn",
+  "n_folds": 8,
+  "seed": 42,
+  "params": {
+    "alpha_frac": 0.35,
+    "l1_ratio": 0.5,
+    "max_iter": 5000
+  }
+}

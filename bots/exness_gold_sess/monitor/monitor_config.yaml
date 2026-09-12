@@ -1,0 +1,144 @@
+# exness_gold_sess — monitoring thresholds (Chapter 26).
+#
+# THIS FILE IS NOT THE KILL CRITERIA. Those are in deploy/risk_config.yaml::breakers, are
+# quoted from BOT.md, and are still awaiting the user. What is here is the *observability*
+# layer: how drift is measured, how the online detectors are configured, and what a challenger
+# model must show before it gets capital. A number here raises an alert; a number there stops
+# the bot.
+#
+# EVERY WINDOW IS COUNTED IN DECISION SESSIONS, NOT DAYS. This bot decides twice a weekday
+# (setup.yaml::decision.cadence: session), so 63 decisions is about six trading weeks. The FX
+# bot's identically named windows mean twice as long in wall-clock time; the unit is written
+# into every key name below so the two are not confused.
+
+bot_id: exness_gold_sess
+cadence: session
+decisions_per_weekday: 2
+
+# ---------------------------------------------------------------------------------------
+# 26/01 — drift
+# ---------------------------------------------------------------------------------------
+drift:
+  # The reference distribution every live window is compared against. TRAIN/VALIDATION ONLY:
+  # the holdout (2025-09-01 .. 2026-08-31) is unscored AND carries a contamination flag
+  # (setup.yaml::evaluation.legacy_v9_contaminated_window), so reading it here would both burn
+  # it and compare against a window a human has already seen.
+  reference_window: validation
+  reference_source: "case_studies/exness_gold_sess/features/financial.parquet, restricted to
+    the four validation folds; assert_no_holdout() enforces the boundary"
+
+  # The live window. 42 decisions is three trading weeks - long enough for a PSI to mean
+  # something on a two-name panel, short enough to notice a regime change inside a quarter.
+  live_window_decisions: 42
+  min_live_decisions: 20
+
+  # Population Stability Index bands, the conventional ones (26/01).
+  psi:
+    watch: 0.10
+    alert: 0.25
+  # Kolmogorov-Smirnov p-value below which the two samples are called different.
+  ks_pvalue_alert: 0.01
+
+  # Which columns are watched. NOT all 43: a PSI on 43 columns produces an alert somewhere
+  # every week and trains the reader to ignore the channel. These are the ones whose drift
+  # would change what the model means, one per built feature family, chosen from the family
+  # register in setup.yaml rather than from any IC.
+  monitored_features:
+    - sess_ret_1h          # session opening move
+    - overnight_gap        # overnight and pre-session
+    - slot_ret_1           # decision-grid momentum
+    - d1_vol_gk_21d        # long-window state (the volatility the barriers scale with)
+    - gsr                  # gold-silver ratio
+    - is_ny                # session and calendar state; constant inside a book BY DESIGN
+
+  # A column that is constant inside a filtered book has no distribution to compare there, and
+  # `is_ny` is exactly that. Listing it as expected stops the per-sleeve report from raising an
+  # alert every single window for a column that is behaving correctly.
+  constant_inside_a_book: [is_ny]
+
+  # Prediction drift: the model's own score distribution against its validation distribution.
+  prediction:
+    psi_alert: 0.25
+    # Share of consecutive scores identical to the one before, PER SLEEVE. The same 0.50
+    # ceiling 05_evaluation applies to a feature. A model whose live score repeats inside the
+    # book that trades it has stopped distinguishing sessions.
+    staleness_ceiling: 0.50
+
+  # Performance. NO ROLLING IC: over two metals a cross-sectional rank correlation takes the
+  # values +/-1 and the registry declines to compute it (min_obs=5 against a panel 2 wide).
+  # BOT.md kill criterion (b) says the same thing and uses hit rate. This is the *alert*
+  # threshold; the *stop* is in deploy/risk_config.yaml::breakers.hit_rate.
+  performance:
+    hit_rate_window_decisions: 63
+    hit_rate_watch: 0.48
+    per_sleeve: true          # london, ny and pooled, reported separately
+
+# ---------------------------------------------------------------------------------------
+# 26/02 — online detectors on the error stream
+# ---------------------------------------------------------------------------------------
+online_detectors:
+  # ADWIN-style two-window mean shift.
+  adwin:
+    min_window_decisions: 30
+    delta: 0.002
+  # Drift Detection Method: warning and drift levels in standard deviations of the running
+  # error rate.
+  ddm:
+    min_decisions: 30
+    warning_sigma: 2.0
+    drift_sigma: 3.0
+  # An error is "the decision lost money". A detector needs a stationary-ish base rate to work
+  # from, and a floor stops a run of tiny wins from making every subsequent loss look like drift.
+  error_rate_floor: 0.05
+  # How many decisions must have happened before a detector's output is reported at all. Below
+  # it the modules return `not_ready` with the count, rather than a number computed on nothing.
+  readiness_decisions: 60
+
+# ---------------------------------------------------------------------------------------
+# 26/03 — safe model rollout
+# ---------------------------------------------------------------------------------------
+rollout:
+  # A challenger never receives capital before it has run alongside the incumbent for a full
+  # shadow stage. 126 decisions is about three trading months on this cadence.
+  stages:
+    - {name: shadow,   capital_fraction: 0.00, min_decisions: 126}
+    - {name: ab_10,    capital_fraction: 0.10, min_decisions: 126}
+    - {name: ab_25,    capital_fraction: 0.25, min_decisions: 126}
+    - {name: staged_50, capital_fraction: 0.50, min_decisions: 252}
+    - {name: full,     capital_fraction: 1.00, min_decisions: 0}
+
+  # THE PROMOTION GATE, FIXED BEFORE ANY CHALLENGER RUNS. This is the point of writing it in a
+  # config file: a gate chosen after seeing the challenger's numbers is not a gate.
+  promotion:
+    # Annualised on 252, NOT 504. PRICE_GRID_DECLARATION.md section 2: the engine writes its
+    # return series on a DAILY grid (about 261 rows a year), so 504 would inflate every Sharpe
+    # by sqrt(2) = 1.414. The 504 belongs to slot-level statistics (decision.slots_per_year).
+    periods_per_year: 252
+    min_sharpe_improvement: 0.20
+    max_drawdown_ratio: 1.00        # the challenger may not draw down more than the incumbent
+    min_decisions: 126
+    # Two models that agree on 95 % of positions are one model with two hashes; promoting the
+    # second buys nothing and costs a rollout.
+    max_position_agreement: 0.95
+    # Sharpe is reported on ACTIVE return against the 1/N long-both-metals book as well as
+    # against zero. With gold, that is mandatory and not optional: the 2017-2026 sample is a
+    # strong uptrend and any long-biased book looks good on raw return (BOT.md, Hypothesis).
+    benchmark: equal_weight_long_both_metals
+    report_active_return: true
+
+# ---------------------------------------------------------------------------------------
+# What is not monitored, named rather than omitted
+# ---------------------------------------------------------------------------------------
+not_monitored:
+  - name: live information coefficient
+    reason: "a cross-sectional IC over two metals takes the values +/-1 and the registry
+      declines to compute it (min_obs=5, case_studies/utils/registry/metrics.py:113). BOT.md
+      kill criterion (b) uses hit rate for exactly this reason."
+  - name: registry avg_turnover
+    reason: "the hold is a broker-level time_exit position rule and a rule-driven exit does not
+      pass through the weight series, so the registry column under-reports by roughly half
+      (PRICE_GRID_DECLARATION.md section 3.4). Honest turnover comes from fills.parquet /
+      trades.parquet, and the cost breaker reads those."
+  - name: the two PLANNED feature families (real yields / USD, CPI / FOMC)
+    reason: "declared PLANNED in setup.yaml::features.families with zero columns built; there
+      is nothing to drift. Each becomes +1 trial family when it is first tried."

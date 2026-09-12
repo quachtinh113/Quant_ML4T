@@ -1,0 +1,39 @@
+"""Portfolio-learning model family."""
+
+from __future__ import annotations
+
+from importlib import import_module
+
+__all__ = [
+    "DeepPortfolioModel",
+    "LinearFeaturePortfolioModel",
+    "LSTMPortfolioModel",
+    "WeightConstraintPostprocessor",
+]
+
+
+def __getattr__(name: str):
+    module_map = {
+        "DeepPortfolioModel": ("ml4t.models.portfolio.deep_portfolio", "DeepPortfolioModel"),
+        "LinearFeaturePortfolioModel": (
+            "ml4t.models.portfolio.linear",
+            "LinearFeaturePortfolioModel",
+        ),
+        "LSTMPortfolioModel": ("ml4t.models.portfolio.lstm", "LSTMPortfolioModel"),
+        "WeightConstraintPostprocessor": (
+            "ml4t.models.portfolio.postprocessors",
+            "WeightConstraintPostprocessor",
+        ),
+    }
+    if name not in module_map:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = module_map[name]
+    try:
+        module = import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name == "torch":
+            raise ImportError(f"{name} requires PyTorch; install ml4t-models[deep]") from exc
+        raise
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value

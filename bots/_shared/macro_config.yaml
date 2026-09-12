@@ -1,0 +1,158 @@
+# Bot-specific macro configuration for the carry family (user decision 4, 2026-09-06).
+# ===================================================================================
+#
+# Schema: identical to `data/macro/config.yaml` (top-level section `macro:`, read by
+# `utils.downloading.load_section`); both `data/macro/download.py` and
+# `data/macro/download_alfred.py` accept it through `--config`. Two things differ:
+#
+#   * `storage_path` resolves under the ML4T data root to a BOT-SPECIFIC directory
+#     (`ML4T_DATA_PATH/mt5/macro_exness_fx_d1/`), and every `outputs.*` file name is its own,
+#     so nothing here touches the shared outputs of `data/macro` (`fred_macro.parquet`,
+#     `fred_macro_raw.parquet`, `fred_macro_initial_release*.parquet`) that other case studies
+#     read. `data/macro/config.yaml` itself is never edited (user decision 4).
+#   * the series are policy rates - one short rate per currency leg of the five dollar pairs
+#     of `exness_fx_d1`, plus the US leg - not the United States yield curve.
+#
+# Commands (repository root, research environment):
+#
+#   uv run python data/macro/download.py --config bots/_shared/macro_config.yaml --list
+#   uv run python data/macro/download_alfred.py --config bots/_shared/macro_config.yaml --dry-run
+#   uv run python data/macro/download.py --config bots/_shared/macro_config.yaml --series DFF
+#   uv run python data/macro/download_alfred.py --config bots/_shared/macro_config.yaml
+#
+# `--list` returns before `require_env` and runs without a key; `download.py --dry-run` does
+# NOT (it calls `require_env("FRED_API_KEY")` before printing its summary), while
+# `download_alfred.py --dry-run` returns before its own `require_env` and does.
+#
+# WHICH FILE THE FEATURE READS
+# ----------------------------
+# Only `carry_initial_release_raw.parquet`, the ALFRED raw table: one row per observation
+# date with `series, timestamp, vintage_date, value`, where `vintage_date` is the date FRED
+# first published that observation. That column is what makes a carry feature point-in-time
+# (Ch08 s8.4, `08_financial_features/04_fundamentals_macro_calendar.py`).
+#
+# The ALIGNED files (`carry.parquet`, `carry_initial_release.parquet`) are DIAGNOSTICS ONLY
+# and `case_studies/exness_fx_d1/_features.py::carry_factor` refuses to read them:
+# `download_alfred.py::build_aligned_panel` pivots on the OBSERVATION date, drops
+# `vintage_date` and forward-fills on a daily calendar. For a monthly policy rate the
+# observation date is the first of the month while the publication date is weeks later, so
+# the aligned panel dates every value up to about eight weeks before anyone could see it.
+# The existing point-in-time test cannot catch that, because it rebuilds the panel from bars
+# and never touches a macro file - which is why the rule is written here and asserted in
+# `bots/exness_fx_d1/tests/test_lookahead.py`.
+#
+# THE JOIN THE FEATURE APPLIES
+# ----------------------------
+#   available_at = vintage_date + availability_lag_days      (lag >= 1, declared below)
+#   join_asof(session grid, on="available_at", strategy="backward")
+#
+# so a decision at session d reads the last value whose `available_at` is at or before d.
+# The lag is one calendar day, not zero: ALFRED dates a vintage by the day of release and
+# says nothing about the hour, and this bot decides at 20:00 UTC, before the close of
+# business in the United States on that same day. A same-day read would be a claim about the
+# release hour that the data does not support. `conservative_lag_days` is the Chapter 8 floor
+# (`04_fundamentals_macro_calendar.py:409-428, :501`, `conservative_lag = 30`), kept for a
+# leg with no usable vintage history; it never replaces a real vintage date.
+#
+# ACCEPTANCE CHECKS PER LEG, BEFORE ANY HISTORY IS FETCHED
+# --------------------------------------------------------
+#   (a) the id resolves on the FRED `series` endpoint;
+#   (b) ALFRED returns vintage dates for it (`download_alfred.py::fetch_vintage_dates` raises
+#       `RuntimeError` on an empty list, which would abort the whole fetch);
+#   (c) `observation_start` <= 2016-01-01, so the leg covers `universe.history_start`
+#       (2017-03-01) together with the feature warmup;
+#   (d) `observation_end` is within 90 days of today.
+# Check (d) matters most: several OECD "Immediate Rates" series were discontinued on FRED,
+# and a leg that stopped updating in, say, 2022 forward-fills one constant across the rest of
+# the sample. Such a column still shows an information coefficient and carries no
+# information. A leg failing (b) or (d) is NOT used to build carry; replace it from the
+# alternates below and re-run the checks.
+#
+# VERIFICATION STATUS (2026-09-07): checked only against `--list` (the config parses and every
+# id is registered under a frequency). NOT checked against FRED: the `FRED_API_KEY=` line in
+# both `.env` files is present but EMPTY (value length 0; `load_dotenv` resolves it to an
+# empty value and `require_env` refuses), so no API call could be made and no history was
+# fetched. See `bots/exness_fx_d1/BOT.md` open question 10.
+#
+# ALTERNATES if a leg fails a check: US `DGS2` or `EFFR`; EUR `ECBMRRFR`; GBP `IUDSOIA`
+# (daily SONIA) or `IR3TIB01GBM156N`; JPY `INTDSRJPM193N` or `IR3TIB01JPM156N`; AUD
+# `IR3TIB01AUM156N`; CAD `IR3TIB01CAM156N`.
+
+macro:
+  provider: fred
+  start: '2000-01-01'
+  end: '2026-12-31'
+  # Bot-specific; never `macro`, which is where data/macro/config.yaml writes.
+  storage_path: mt5/macro_exness_fx_d1
+  generate_profile: true
+  outputs:
+    aligned_file: carry.parquet
+    raw_file: carry_raw.parquet
+    metadata_file: carry_metadata.parquet
+
+  # The point-in-time table: for every observation date, the first value ALFRED recorded and
+  # the vintage it was published in.
+  alfred_initial_release:
+    symbols:
+      - DFF
+      - ECBDFR
+      - IRSTCB01GBM156N
+      - IRSTCI01JPM156N
+      - IRSTCB01AUM156N
+      - IRSTCB01CAM156N
+    outputs:
+      aligned_file: carry_initial_release.parquet
+      raw_file: carry_initial_release_raw.parquet
+    # No `derived`: a differential of two policy rates is point-in-time only when each leg is
+    # taken at its own publication date, and `build_aligned_panel` subtracts columns already
+    # forward-filled by observation date. The differentials are built per pair and per
+    # decision instant in `_features.py::carry_factor`.
+
+  series:
+    daily:
+      description: "Overnight policy rates published daily"
+      symbols:
+        - DFF
+        - ECBDFR
+    monthly:
+      description: "Central-bank policy rates published monthly (OECD Main Economic Indicators)"
+      symbols:
+        - IRSTCB01GBM156N
+        - IRSTCI01JPM156N
+        - IRSTCB01AUM156N
+        - IRSTCB01CAM156N
+
+  descriptions:
+    DFF: "United States: Federal Funds Effective Rate (daily)"
+    ECBDFR: "Euro area: ECB Deposit Facility Rate (daily)"
+    IRSTCB01GBM156N: "United Kingdom: Immediate Rates, Central Bank Rates (monthly)"
+    IRSTCI01JPM156N: "Japan: Immediate Rates, Call Money / Interbank Rate (monthly)"
+    IRSTCB01AUM156N: "Australia: Immediate Rates, Central Bank Rates (monthly)"
+    IRSTCB01CAM156N: "Canada: Immediate Rates, Central Bank Rates (monthly)"
+
+# Not part of the `data/macro` schema and ignored by both downloaders. Read by
+# `case_studies/exness_fx_d1/_features.py::carry_factor`, so the ids live in exactly one
+# place. `availability_lag_days` and `conservative_lag_days` are described above.
+#
+# SIGN CONVENTION. The carry of a pair is the rate of its BASE currency minus the rate of its
+# QUOTE currency, in percent per annum, each leg at its own last published vintage:
+#
+#     carry(XXXYYY) = rate(XXX) - rate(YYY)
+#
+# There are two groups in this universe and they are not the same arithmetic:
+#   * USD on the QUOTE leg - EURUSD, GBPUSD, AUDUSD: carry = foreign rate - DFF.
+#   * USD on the BASE leg  - USDJPY, USDCAD:         carry = DFF - foreign rate.
+# In both groups a positive value means a long position in the pair earns the differential,
+# which is the whole reason the formula is written per group rather than "foreign minus US".
+# `bots/exness_fx_d1/tests/test_lookahead.py` checks one pair of each group by hand.
+carry:
+  availability_lag_days: 1
+  conservative_lag_days: 30
+  raw_file: carry_initial_release_raw.parquet
+  legs:
+    USD: DFF
+    EUR: ECBDFR
+    GBP: IRSTCB01GBM156N
+    JPY: IRSTCI01JPM156N
+    AUD: IRSTCB01AUM156N
+    CAD: IRSTCB01CAM156N
