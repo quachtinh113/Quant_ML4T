@@ -11,6 +11,6 @@ echo ====================================================== >> "%LOG_FILE%"
 echo [%DATE% %TIME%] Running exness_usidx_sess (Account: 463960820) >> "%LOG_FILE%"
 echo ====================================================== >> "%LOG_FILE%"
 
-py -3.12 -m bots.exness_usidx_sess.deploy.deployment_loop --cycle >> "%LOG_FILE%" 2>&1
+py -3.12 -m bots.exness_usidx_sess.deploy.deployment_loop >> "%LOG_FILE%" 2>&1
 echo Exit code: %ERRORLEVEL% >> "%LOG_FILE%"
 endlocal
